@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import t
-from typing import Optional
 
 # =========================
 # CONFIG
@@ -47,7 +47,7 @@ def load_data(path):
 df = load_data(CSV_PATH)
 
 # =========================
-# SCHEMA
+# REQUEST MODEL
 # =========================
 class EstimateRequest(BaseModel):
     year: int
@@ -58,7 +58,7 @@ class EstimateRequest(BaseModel):
     confidence: float = 0.9
 
 # =========================
-# LOGIC
+# CORE LOGIC
 # =========================
 def train_regression(sub_df):
     X = sub_df[["odometer"]].values
@@ -82,15 +82,30 @@ def estimate_value(payload: EstimateRequest):
         (df.model == payload.model.upper())
     ]
 
+    base_comps = comps.copy()
+
     if payload.trim:
         comps = comps[
-            comps.trim.str.contains(payload.trim.upper(), na=False)
+            comps.trim.str.contains(
+                payload.trim.upper(),
+                regex=False,
+                na=False
+            )
         ]
+
+    if len(comps) == 0:
+        comps = base_comps
 
     n = len(comps)
 
     if n == 0:
-        raise HTTPException(status_code=404, detail="No comparable vehicles found")
+        return {
+            "price": None,
+            "low": None,
+            "high": None,
+            "comparables": 0,
+            "note": "No comparable vehicles found"
+        }
 
     if n == 1:
         base = comps.iloc[0]
@@ -119,7 +134,7 @@ def estimate_value(payload: EstimateRequest):
     X_new = scaler.transform([[payload.odometer]])
     pred = lr.predict(X_new)[0]
 
-    if not np.isfinite(sigma):
+    if not np.isfinite(sigma) or sigma == 0:
         return {
             "price": round(pred, 0),
             "low": None,
