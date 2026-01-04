@@ -83,7 +83,7 @@ def estimate_value(payload: EstimateRequest):
         (df.model == payload.model.upper())
     ]
     if payload.trim:
-    comps = comps[df.trim.str.contains(payload.trim.upper(), na=False)]
+        comps = comps[df.trim.str.contains(payload.trim.upper(), na=False)]
     n = len(comps)
 
     if n == 0:
@@ -145,5 +145,6 @@ def health_check():
 @app.post("/estimate")
 def estimate(payload: EstimateRequest):
     return estimate_value(payload)
+
 
 
