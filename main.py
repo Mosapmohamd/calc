@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import t
+from typing import Optional
 
 # =========================
 # CONFIG
@@ -39,22 +40,20 @@ def load_data(path):
     df["model"] = df["model"].astype(str).str.upper().str.strip()
     df["trim"] = df["trim"].astype(str).str.upper().str.strip()
 
-    df = df.dropna(
-        subset=["year", "make", "model", "trim", "odometer", "price"]
-    )
+    df = df.dropna(subset=["year", "make", "model", "odometer", "price"])
 
     return df
 
 df = load_data(CSV_PATH)
 
 # =========================
-# MODELS
+# SCHEMA
 # =========================
 class EstimateRequest(BaseModel):
     year: int
     make: str
     model: str
-    trim: str | None = None
+    trim: Optional[str] = None
     odometer: int
     confidence: float = 0.9
 
@@ -82,8 +81,12 @@ def estimate_value(payload: EstimateRequest):
         (df.make == payload.make.upper()) &
         (df.model == payload.model.upper())
     ]
+
     if payload.trim:
-        comps = comps[df.trim.str.contains(payload.trim.upper(), na=False)]
+        comps = comps[
+            comps.trim.str.contains(payload.trim.upper(), na=False)
+        ]
+
     n = len(comps)
 
     if n == 0:
@@ -103,8 +106,9 @@ def estimate_value(payload: EstimateRequest):
         }
 
     if n == 2:
+        mean_price = comps.price.mean()
         return {
-            "price": round(comps.price.mean(), 0),
+            "price": round(mean_price, 0),
             "low": None,
             "high": None,
             "comparables": 2,
@@ -145,6 +149,3 @@ def health_check():
 @app.post("/estimate")
 def estimate(payload: EstimateRequest):
     return estimate_value(payload)
-
-
-
