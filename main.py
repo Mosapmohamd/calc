@@ -54,7 +54,7 @@ class EstimateRequest(BaseModel):
     year: int
     make: str
     model: str
-    trim: str
+    trim: str | None = None
     odometer: int
     confidence: float = 0.9
 
@@ -134,13 +134,7 @@ def estimate_value(payload: EstimateRequest):
         "comparables": n,
         "note": None
     }
-    class EstimateRequest(BaseModel):
-    year: int
-    make: str
-    model: str
-    trim: str | None = None
-    odometer: int
-    confidence: float = 0.9
+
 # =========================
 # ROUTES
 # =========================
@@ -151,4 +145,5 @@ def health_check():
 @app.post("/estimate")
 def estimate(payload: EstimateRequest):
     return estimate_value(payload)
+
 
