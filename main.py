@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import pandas as pd
@@ -18,7 +18,7 @@ app = FastAPI(title="Vehicle Fair Value API")
 # =========================
 # DATA LOADING
 # =========================
-def load_data(path):
+def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
 
@@ -42,7 +42,7 @@ def load_data(path):
 
     df = df.dropna(subset=["year", "make", "model", "odometer", "price"])
 
-    return df
+    return df.reset_index(drop=True)
 
 df = load_data(CSV_PATH)
 
@@ -60,7 +60,7 @@ class EstimateRequest(BaseModel):
 # =========================
 # CORE LOGIC
 # =========================
-def train_regression(sub_df):
+def train_regression(sub_df: pd.DataFrame):
     X = sub_df[["odometer"]].values
     y = sub_df["price"].values
 
@@ -73,33 +73,37 @@ def train_regression(sub_df):
     residuals = y - model.predict(X_scaled)
     sigma = np.std(residuals, ddof=1)
 
-    return model, scaler, sigma, len(sub_df)
+    return model, scaler, sigma
 
 def estimate_value(payload: EstimateRequest):
+    year = payload.year
+    make = payload.make.upper().strip()
+    model = payload.model.upper().strip()
+    trim = payload.trim.upper().strip() if payload.trim else None
+
+    confidence = min(max(payload.confidence, 0.5), 0.99)
+
     comps = df[
-        (df.year == payload.year) &
-        (df.make == payload.make.upper()) &
-        (df.model == payload.model.upper())
+        (df.year == year) &
+        (df.make == make) &
+        (df.model == model)
     ]
 
     base_comps = comps.copy()
 
-    if payload.trim:
-        comps = comps[
-            comps.trim.str.contains(
-                payload.trim.upper(),
-                regex=False,
-                na=False
-            )
-        ]
+    if trim:
+        comps = comps[comps.trim.str.contains(trim, regex=False, na=False)]
 
-    if len(comps) == 0:
+    if comps.empty:
         comps = base_comps
 
     n = len(comps)
 
+    title = f"{year} {make} {model}" + (f" {trim}" if trim else "")
+
     if n == 0:
         return {
+            "title": title,
             "price": None,
             "low": None,
             "high": None,
@@ -113,40 +117,44 @@ def estimate_value(payload: EstimateRequest):
         adjusted_price = base.price - (km_diff * MILEAGE_RATE)
 
         return {
+            "title": title,
             "price": round(adjusted_price, 0),
             "low": None,
             "high": None,
             "comparables": 1,
-            "note": "Single comparable. Mileage adjusted."
+            "note": "Single comparable. Mileage adjusted"
         }
 
     if n == 2:
         mean_price = comps.price.mean()
         return {
+            "title": title,
             "price": round(mean_price, 0),
             "low": None,
             "high": None,
             "comparables": 2,
-            "note": "Two comparables. Average price."
+            "note": "Two comparables. Average price"
         }
 
-    lr, scaler, sigma, n = train_regression(comps)
+    lr, scaler, sigma = train_regression(comps)
     X_new = scaler.transform([[payload.odometer]])
     pred = lr.predict(X_new)[0]
 
     if not np.isfinite(sigma) or sigma == 0:
         return {
+            "title": title,
             "price": round(pred, 0),
             "low": None,
             "high": None,
             "comparables": n,
-            "note": "Insufficient variance."
+            "note": "Insufficient variance"
         }
 
-    t_val = t.ppf((1 + payload.confidence) / 2, df=n - 1)
+    t_val = t.ppf((1 + confidence) / 2, df=n - 1)
     margin = t_val * sigma
 
     return {
+        "title": title,
         "price": round(pred, 0),
         "low": round(pred - margin, 0),
         "high": round(pred + margin, 0),
