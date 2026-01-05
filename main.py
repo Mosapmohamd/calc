@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import t
+import re
 
 # =========================
 # CONFIG
@@ -14,6 +15,34 @@ CSV_PATH = "test.csv"
 MILEAGE_RATE = 0.10
 
 app = FastAPI(title="Vehicle Fair Value API")
+
+# =========================
+# NORMALIZATION HELPERS
+# =========================
+def norm(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    return re.sub(r"[^A-Z0-9\- ]", "", s.upper()).strip()
+
+def match_value(value: Optional[str], valid_values: set[str]) -> Optional[str]:
+    """
+    CSV-driven matching:
+    1. Exact match
+    2. Contains match (both directions)
+    """
+    if not value:
+        return None
+
+    value = norm(value)
+
+    if value in valid_values:
+        return value
+
+    for v in valid_values:
+        if value in v or v in value:
+            return v
+
+    return None
 
 # =========================
 # DATA LOADING
@@ -44,6 +73,16 @@ def load_data(path: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 df = load_data(CSV_PATH)
+
+# =========================
+# CSV-DRIVEN LOOKUPS
+# =========================
+VALID_MAKES = set(df.make.unique())
+VALID_MODELS = set(df.model.unique())
+VALID_TRIMS = set(df.trim.dropna().unique())
+
+print(f"Loaded {len(df)} rows")
+print(f"Makes: {len(VALID_MAKES)}, Models: {len(VALID_MODELS)}, Trims: {len(VALID_TRIMS)}")
 
 # =========================
 # REQUEST MODELS
@@ -79,11 +118,25 @@ def train_regression(sub_df: pd.DataFrame):
     return model, scaler, sigma
 
 def estimate_value(payload: EstimateRequest):
-    year = payload.year
-    make = payload.make.upper().strip()
-    model = payload.model.upper().strip()
-    trim = payload.trim.upper().strip() if payload.trim else None
     confidence = min(max(payload.confidence, 0.5), 0.99)
+
+    # ---- CSV-DRIVEN NORMALIZATION ----
+    make = match_value(payload.make, VALID_MAKES)
+    model = match_value(payload.model, VALID_MODELS)
+    trim = match_value(payload.trim, VALID_TRIMS)
+
+    year = payload.year
+
+    if not make or not model:
+        title = f"{year} {payload.make} {payload.model}"
+        return {
+            "title": title,
+            "price": None,
+            "low": None,
+            "high": None,
+            "comparables": 0,
+            "note": "Make or model not found in dataset"
+        }
 
     comps = df[
         (df.year == year) &
@@ -176,7 +229,4 @@ def estimate(payload: EstimateRequest):
 
 @app.post("/estimate/batch")
 def estimate_batch(payload: BatchEstimateRequest):
-    results = []
-    for vehicle in payload.vehicles:
-        results.append(estimate_value(vehicle))
-    return results
+    return [estimate_value(v) for v in payload.vehicles]
