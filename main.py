@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -41,13 +41,12 @@ def load_data(path: str) -> pd.DataFrame:
     df["trim"] = df["trim"].astype(str).str.upper().str.strip()
 
     df = df.dropna(subset=["year", "make", "model", "odometer", "price"])
-
     return df.reset_index(drop=True)
 
 df = load_data(CSV_PATH)
 
 # =========================
-# REQUEST MODEL
+# REQUEST MODELS
 # =========================
 class EstimateRequest(BaseModel):
     year: int
@@ -56,6 +55,10 @@ class EstimateRequest(BaseModel):
     trim: Optional[str] = None
     odometer: int
     confidence: float = 0.9
+
+
+class BatchEstimateRequest(BaseModel):
+    vehicles: List[EstimateRequest]
 
 # =========================
 # CORE LOGIC
@@ -80,7 +83,6 @@ def estimate_value(payload: EstimateRequest):
     make = payload.make.upper().strip()
     model = payload.model.upper().strip()
     trim = payload.trim.upper().strip() if payload.trim else None
-
     confidence = min(max(payload.confidence, 0.5), 0.99)
 
     comps = df[
@@ -98,7 +100,6 @@ def estimate_value(payload: EstimateRequest):
         comps = base_comps
 
     n = len(comps)
-
     title = f"{year} {make} {model}" + (f" {trim}" if trim else "")
 
     if n == 0:
@@ -172,3 +173,10 @@ def health_check():
 @app.post("/estimate")
 def estimate(payload: EstimateRequest):
     return estimate_value(payload)
+
+@app.post("/estimate/batch")
+def estimate_batch(payload: BatchEstimateRequest):
+    results = []
+    for vehicle in payload.vehicles:
+        results.append(estimate_value(vehicle))
+    return results
