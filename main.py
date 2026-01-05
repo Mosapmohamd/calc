@@ -7,6 +7,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import t
 import re
+from collections import defaultdict
 
 # =========================
 # CONFIG
@@ -24,32 +25,25 @@ def norm(s: Optional[str]) -> Optional[str]:
         return None
     return re.sub(r"[^A-Z0-9\- ]", "", s.upper()).strip()
 
-def match_value(value: Optional[str], valid_values: set[str]) -> Optional[str]:
-    """
-    CSV-driven matching:
-    1. Exact match
-    2. Contains match (both directions)
-    """
+def match_value(value: Optional[str], valid_set: set[str]) -> Optional[str]:
     if not value:
         return None
 
     value = norm(value)
-
-    if value in valid_values:
+    if value in valid_set:
         return value
 
-    for v in valid_values:
+    for v in valid_set:
         if value in v or v in value:
             return v
 
     return None
 
 # =========================
-# DATA LOADING
+# LOAD CSV
 # =========================
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
 
     df = df.rename(columns={
         "Year": "year",
@@ -58,7 +52,6 @@ def load_data(path: str) -> pd.DataFrame:
         "Trim": "trim",
         "Odometer": "odometer",
         "Price": "price",
-        "Sale Date": "sale_date",
     })
 
     df["year"] = pd.to_numeric(df["year"], errors="coerce")
@@ -69,8 +62,7 @@ def load_data(path: str) -> pd.DataFrame:
     df["model"] = df["model"].astype(str).str.upper().str.strip()
     df["trim"] = df["trim"].astype(str).str.upper().str.strip()
 
-    df = df.dropna(subset=["year", "make", "model", "odometer", "price"])
-    return df.reset_index(drop=True)
+    return df.dropna(subset=["year", "make", "model", "odometer", "price"])
 
 df = load_data(CSV_PATH)
 
@@ -79,10 +71,12 @@ df = load_data(CSV_PATH)
 # =========================
 VALID_MAKES = set(df.make.unique())
 VALID_MODELS = set(df.model.unique())
-VALID_TRIMS = set(df.trim.dropna().unique())
+
+TRIM_MAP = defaultdict(set)
+for _, row in df.iterrows():
+    TRIM_MAP[(row.make, row.model)].add(row.trim)
 
 print(f"Loaded {len(df)} rows")
-print(f"Makes: {len(VALID_MAKES)}, Models: {len(VALID_MODELS)}, Trims: {len(VALID_TRIMS)}")
 
 # =========================
 # REQUEST MODELS
@@ -95,14 +89,26 @@ class EstimateRequest(BaseModel):
     odometer: int
     confidence: float = 0.9
 
-
 class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
 
 # =========================
-# CORE LOGIC
+# TRIM VALIDATION (STRICT)
 # =========================
-def train_regression(sub_df: pd.DataFrame):
+def match_trim(trim: Optional[str], make: str, model: str) -> Optional[str]:
+    if not trim:
+        return None
+
+    trim = norm(trim)
+    valid_trims = TRIM_MAP.get((make, model), set())
+
+    # EXACT MATCH ONLY
+    return trim if trim in valid_trims else None
+
+# =========================
+# REGRESSION
+# =========================
+def train_regression(sub_df):
     X = sub_df[["odometer"]].values
     y = sub_df["price"].values
 
@@ -117,29 +123,27 @@ def train_regression(sub_df: pd.DataFrame):
 
     return model, scaler, sigma
 
-def estimate_value(payload: EstimateRequest):
-    confidence = min(max(payload.confidence, 0.5), 0.99)
+# =========================
+# CORE LOGIC
+# =========================
+def estimate_value(p: EstimateRequest):
+    confidence = min(max(p.confidence, 0.5), 0.99)
 
-    # ---- CSV-DRIVEN NORMALIZATION ----
-    make = match_value(payload.make, VALID_MAKES)
-    model = match_value(payload.model, VALID_MODELS)
-    trim = match_value(payload.trim, VALID_TRIMS)
-
-    year = payload.year
+    make = match_value(p.make, VALID_MAKES)
+    model = match_value(p.model, VALID_MODELS)
 
     if not make or not model:
-        title = f"{year} {payload.make} {payload.model}"
         return {
-            "title": title,
+            "title": f"{p.year} {p.make} {p.model}",
             "price": None,
-            "low": None,
-            "high": None,
             "comparables": 0,
-            "note": "Make or model not found in dataset"
+            "note": "Make or model not found"
         }
 
+    trim = match_trim(p.trim, make, model)
+
     comps = df[
-        (df.year == year) &
+        (df.year == p.year) &
         (df.make == make) &
         (df.model == model)
     ]
@@ -147,61 +151,49 @@ def estimate_value(payload: EstimateRequest):
     base_comps = comps.copy()
 
     if trim:
-        comps = comps[comps.trim.str.contains(trim, regex=False, na=False)]
+        comps = comps[comps.trim == trim]
 
     if comps.empty:
         comps = base_comps
 
     n = len(comps)
-    title = f"{year} {make} {model}" + (f" {trim}" if trim else "")
+    title = f"{p.year} {make} {model}" + (f" {trim}" if trim else "")
 
     if n == 0:
         return {
             "title": title,
             "price": None,
-            "low": None,
-            "high": None,
             "comparables": 0,
             "note": "No comparable vehicles found"
         }
 
     if n == 1:
         base = comps.iloc[0]
-        km_diff = payload.odometer - base.odometer
-        adjusted_price = base.price - (km_diff * MILEAGE_RATE)
-
+        adj = base.price - (p.odometer - base.odometer) * MILEAGE_RATE
         return {
             "title": title,
-            "price": round(adjusted_price, 0),
-            "low": None,
-            "high": None,
+            "price": round(adj, 0),
             "comparables": 1,
-            "note": "Single comparable. Mileage adjusted"
+            "note": "Single comparable"
         }
 
     if n == 2:
-        mean_price = comps.price.mean()
         return {
             "title": title,
-            "price": round(mean_price, 0),
-            "low": None,
-            "high": None,
+            "price": round(comps.price.mean(), 0),
             "comparables": 2,
-            "note": "Two comparables. Average price"
+            "note": "Average of two"
         }
 
     lr, scaler, sigma = train_regression(comps)
-    X_new = scaler.transform([[payload.odometer]])
-    pred = lr.predict(X_new)[0]
+    pred = lr.predict(scaler.transform([[p.odometer]]))[0]
 
-    if not np.isfinite(sigma) or sigma == 0:
+    if not np.isfinite(sigma):
         return {
             "title": title,
             "price": round(pred, 0),
-            "low": None,
-            "high": None,
             "comparables": n,
-            "note": "Insufficient variance"
+            "note": "Low variance"
         }
 
     t_val = t.ppf((1 + confidence) / 2, df=n - 1)
@@ -220,13 +212,13 @@ def estimate_value(payload: EstimateRequest):
 # ROUTES
 # =========================
 @app.get("/")
-def health_check():
+def health():
     return {"status": "ok"}
 
 @app.post("/estimate")
-def estimate(payload: EstimateRequest):
-    return estimate_value(payload)
+def estimate(p: EstimateRequest):
+    return estimate_value(p)
 
 @app.post("/estimate/batch")
-def estimate_batch(payload: BatchEstimateRequest):
-    return [estimate_value(v) for v in payload.vehicles]
+def estimate_batch(p: BatchEstimateRequest):
+    return [estimate_value(v) for v in p.vehicles]
