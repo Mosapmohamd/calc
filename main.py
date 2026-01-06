@@ -10,7 +10,8 @@ import re
 from collections import defaultdict
 
 CSV_PATH = "test.csv"
-YEAR_RANGE = 1
+YEAR_RANGE = 2
+MILEAGE_RATE = 0.10
 
 app = FastAPI(title="Vehicle Fair Value API")
 
@@ -96,7 +97,7 @@ def match_trim(trim, make, model):
 # =========================
 def find_nearest_year_data(make, model, target_year):
     for d in range(0, YEAR_RANGE + 1):
-        years = [target_year + d] if d == 0 else [target_year + d, target_year - d]
+        years = [target_year] if d == 0 else [target_year + d, target_year - d]
         for y in years:
             comps = df[
                 (df.make == make) &
@@ -139,17 +140,13 @@ def estimate_value(p: EstimateRequest):
 
     if not make or not model:
         return {
+            "title": f"{p.year} {p.make} {p.model}",
             "price": None,
+            "comparables": 0,
             "note": "Make or model not found"
         }
 
     comps, used_year = find_nearest_year_data(make, model, p.year)
-
-    if comps.empty:
-        return {
-            "price": None,
-            "note": "No data found for nearby years"
-        }
 
     trim = match_trim(p.trim, make, model)
     if trim:
@@ -157,12 +154,38 @@ def estimate_value(p: EstimateRequest):
         if not comps_trim.empty:
             comps = comps_trim
 
-    if len(comps) < 3:
+    n = len(comps)
+
+    title = f"{p.year} {make} {model}"
+    if trim:
+        title += f" {trim}"
+
+    if n == 0:
         return {
+            "title": title,
             "price": None,
-            "comparables": len(comps),
-            "used_year": used_year,
-            "note": "Not enough data for regression"
+            "comparables": 0,
+            "note": "No comparable vehicles found"
+        }
+
+    if n == 1:
+        base = comps.iloc[0]
+        adj_price = base.price - (p.odometer - base.odometer) * MILEAGE_RATE
+        return {
+            "title": title,
+            "estimated_year": used_year,
+            "price": round(adj_price, 0),
+            "comparables": 1,
+            "note": "Single comparable with mileage adjustment"
+        }
+
+    if n == 2:
+        return {
+            "title": title,
+            "estimated_year": used_year,
+            "price": round(comps.price.mean(), 0),
+            "comparables": 2,
+            "note": "Average of two comparables"
         }
 
     lr, scaler, sigma, cols = train_regression(comps)
@@ -178,17 +201,26 @@ def estimate_value(p: EstimateRequest):
 
     pred = lr.predict(scaler.transform(input_row))[0]
 
-    t_val = t.ppf((1 + confidence) / 2, df=len(comps) - 1)
+    if not np.isfinite(sigma):
+        return {
+            "title": title,
+            "estimated_year": used_year,
+            "price": round(pred, 0),
+            "comparables": n,
+            "note": "Low variance"
+        }
+
+    t_val = t.ppf((1 + confidence) / 2, df=n - 1)
     margin = t_val * sigma
 
     return {
-        "requested_year": p.year,
+        "title": title,
         "estimated_year": used_year,
         "price": round(pred, 0),
         "low": round(pred - margin, 0),
         "high": round(pred + margin, 0),
-        "comparables": len(comps),
-        "note": f"Estimated using year {used_year}"
+        "comparables": n,
+        "note": None
     }
 
 # =========================
