@@ -10,34 +10,67 @@ import re
 from collections import defaultdict
 
 CSV_PATH = "test.csv"
-YEAR_RANGE = 1
+YEAR_RANGE = 2
 MILEAGE_RATE = 0.10
 
 app = FastAPI(title="Vehicle Fair Value API")
 
 # =========================
+# MODEL ALIASES
+# =========================
+MODEL_ALIASES = {
+    "SLVRDO": "SILVERADO",
+    "SILVRDO": "SILVERADO",
+    "SILVERADO": "SILVERADO",
+
+    "GRNDCRVN": "GRAND CARAVAN",
+    "GRANDCRVN": "GRAND CARAVAN",
+    "GRAND CARAVAN": "GRAND CARAVAN",
+
+    "F150": "F-150",
+    "F 150": "F-150",
+}
+
+# =========================
 # HELPERS
 # =========================
-def norm(s):
+def norm(s: Optional[str]):
     if not s:
         return None
     return re.sub(r"[^A-Z0-9\- ]", "", s.upper()).strip()
 
-def match_value(value, valid_set):
+def normalize_model(raw: Optional[str]):
+    if not raw:
+        return None
+
+    cleaned = (
+        raw.upper()
+        .replace("-", " ")
+        .replace("_", " ")
+        .strip()
+    )
+
+    key = cleaned.replace(" ", "")
+    return MODEL_ALIASES.get(key, cleaned)
+
+def match_value(value: Optional[str], valid_set: set):
     if not value:
         return None
+
     value = norm(value)
     if value in valid_set:
         return value
+
     for v in valid_set:
         if value in v or v in value:
             return v
+
     return None
 
 # =========================
 # LOAD DATA
 # =========================
-def load_data(path):
+def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
 
     df = df.rename(columns={
@@ -135,7 +168,10 @@ def estimate_value(p: EstimateRequest):
     confidence = min(max(p.confidence, 0.5), 0.99)
 
     make = match_value(p.make, VALID_MAKES)
-    model = match_value(p.model, VALID_MODELS)
+
+    normalized_model = normalize_model(p.model)
+    model = match_value(normalized_model, VALID_MODELS)
+
     province = match_value(p.province, VALID_PROVINCES)
 
     if not make or not model:
@@ -149,7 +185,6 @@ def estimate_value(p: EstimateRequest):
     comps, used_year = find_nearest_year_data(make, model, p.year)
 
     trim = match_trim(p.trim, make, model)
-    
     if trim and "trim" in comps.columns:
         comps_trim = comps[comps["trim"] == trim]
         if not comps_trim.empty:
@@ -238,5 +273,3 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
-
-
