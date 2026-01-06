@@ -11,6 +11,7 @@ from collections import defaultdict
 
 CSV_PATH = "test.csv"
 MILEAGE_RATE = 0.10
+YEAR_RANGE = 1   
 
 app = FastAPI(title="Vehicle Fair Value API")
 
@@ -113,6 +114,26 @@ def train_regression(sub_df: pd.DataFrame):
     return model, scaler, sigma, X.columns
 
 # =========================
+# YEAR FALLBACK FILTER
+# =========================
+def get_comps_with_year_fallback(make, model, year):
+    for d in range(0, YEAR_RANGE + 1):
+        years = [year]
+        if d > 0:
+            years = [year - d, year + d]
+
+        comps = df[
+            (df.make == make) &
+            (df.model == model) &
+            (df.year.isin(years))
+        ]
+
+        if not comps.empty:
+            return comps, years
+
+    return pd.DataFrame(), []
+
+# =========================
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
@@ -130,15 +151,13 @@ def estimate_value(p: EstimateRequest):
             "note": "Make or model not found"
         }
 
-    comps = df[
-        (df.year == p.year) &
-        (df.make == make) &
-        (df.model == model)
-    ]
+    comps, used_years = get_comps_with_year_fallback(make, model, p.year)
 
     trim = match_trim(p.trim, make, model)
     if trim:
-        comps = comps[comps.trim == trim]
+        comps_trim = comps[comps.trim == trim]
+        if not comps_trim.empty:
+            comps = comps_trim
 
     n = len(comps)
 
@@ -161,7 +180,7 @@ def estimate_value(p: EstimateRequest):
             "title": title,
             "price": round(comps.price.mean(), 0),
             "comparables": n,
-            "note": "Not enough data for regression"
+            "note": f"Used nearby years {used_years}"
         }
 
     lr, scaler, sigma, cols = train_regression(comps)
@@ -186,7 +205,7 @@ def estimate_value(p: EstimateRequest):
         "low": round(pred - margin, 0),
         "high": round(pred + margin, 0),
         "comparables": n,
-        "note": None
+        "note": f"Used years {used_years}"
     }
 
 # =========================
