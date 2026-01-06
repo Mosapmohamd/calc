@@ -93,11 +93,10 @@ def match_trim(trim: Optional[str], make: str, model: str) -> Optional[str]:
     return trim if trim in TRIM_MAP.get((make, model), set()) else None
 
 # =========================
-# REGRESSION WITH PROVINCE
+# REGRESSION
 # =========================
 def train_regression(sub_df: pd.DataFrame):
-    X = sub_df[["odometer", "province"]]
-
+    X = sub_df[["odometer", "year", "province"]]
     X = pd.get_dummies(X, columns=["province"], drop_first=True)
 
     y = sub_df["price"].values
@@ -169,6 +168,7 @@ def estimate_value(p: EstimateRequest):
 
     input_row = pd.DataFrame([{
         "odometer": p.odometer,
+        "year": p.year,
         "province": province if province else comps.province.mode()[0]
     }])
 
