@@ -10,20 +10,19 @@ import re
 from collections import defaultdict
 
 CSV_PATH = "test.csv"
-MILEAGE_RATE = 0.10
-YEAR_RANGE = 1   
+YEAR_RANGE = 1
 
 app = FastAPI(title="Vehicle Fair Value API")
 
 # =========================
 # HELPERS
 # =========================
-def norm(s: Optional[str]) -> Optional[str]:
+def norm(s):
     if not s:
         return None
     return re.sub(r"[^A-Z0-9\- ]", "", s.upper()).strip()
 
-def match_value(value: Optional[str], valid_set: set[str]) -> Optional[str]:
+def match_value(value, valid_set):
     if not value:
         return None
     value = norm(value)
@@ -37,7 +36,7 @@ def match_value(value: Optional[str], valid_set: set[str]) -> Optional[str]:
 # =========================
 # LOAD DATA
 # =========================
-def load_data(path: str) -> pd.DataFrame:
+def load_data(path):
     df = pd.read_csv(path)
 
     df = df.rename(columns={
@@ -50,14 +49,13 @@ def load_data(path: str) -> pd.DataFrame:
         "Province": "province",
     })
 
-    df["year"] = pd.to_numeric(df["year"], errors="coerce")
-    df["odometer"] = pd.to_numeric(df["odometer"], errors="coerce")
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    for c in ["year", "odometer", "price"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
     for c in ["make", "model", "trim", "province"]:
         df[c] = df[c].astype(str).str.upper().str.strip()
 
-    return df.dropna(subset=["year", "make", "model", "odometer", "price", "province"])
+    return df.dropna()
 
 df = load_data(CSV_PATH)
 
@@ -87,16 +85,32 @@ class BatchEstimateRequest(BaseModel):
 # =========================
 # TRIM
 # =========================
-def match_trim(trim: Optional[str], make: str, model: str) -> Optional[str]:
+def match_trim(trim, make, model):
     if not trim:
         return None
     trim = norm(trim)
     return trim if trim in TRIM_MAP.get((make, model), set()) else None
 
 # =========================
+# FIND NEAREST YEAR DATA
+# =========================
+def find_nearest_year_data(make, model, target_year):
+    for d in range(0, YEAR_RANGE + 1):
+        years = [target_year + d] if d == 0 else [target_year + d, target_year - d]
+        for y in years:
+            comps = df[
+                (df.make == make) &
+                (df.model == model) &
+                (df.year == y)
+            ]
+            if not comps.empty:
+                return comps, y
+    return pd.DataFrame(), None
+
+# =========================
 # REGRESSION
 # =========================
-def train_regression(sub_df: pd.DataFrame):
+def train_regression(sub_df):
     X = sub_df[["odometer", "year", "province"]]
     X = pd.get_dummies(X, columns=["province"], drop_first=True)
 
@@ -114,26 +128,6 @@ def train_regression(sub_df: pd.DataFrame):
     return model, scaler, sigma, X.columns
 
 # =========================
-# YEAR FALLBACK FILTER
-# =========================
-def get_comps_with_year_fallback(make, model, year):
-    for d in range(0, YEAR_RANGE + 1):
-        years = [year]
-        if d > 0:
-            years = [year - d, year + d]
-
-        comps = df[
-            (df.make == make) &
-            (df.model == model) &
-            (df.year.isin(years))
-        ]
-
-        if not comps.empty:
-            return comps, years
-
-    return pd.DataFrame(), []
-
-# =========================
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
@@ -145,13 +139,17 @@ def estimate_value(p: EstimateRequest):
 
     if not make or not model:
         return {
-            "title": f"{p.year} {p.make} {p.model}",
             "price": None,
-            "comparables": 0,
             "note": "Make or model not found"
         }
 
-    comps, used_years = get_comps_with_year_fallback(make, model, p.year)
+    comps, used_year = find_nearest_year_data(make, model, p.year)
+
+    if comps.empty:
+        return {
+            "price": None,
+            "note": "No data found for nearby years"
+        }
 
     trim = match_trim(p.trim, make, model)
     if trim:
@@ -159,35 +157,19 @@ def estimate_value(p: EstimateRequest):
         if not comps_trim.empty:
             comps = comps_trim
 
-    n = len(comps)
-
-    title = f"{p.year} {make} {model}"
-    if trim:
-        title += f" {trim}"
-    if province:
-        title += f" ({province})"
-
-    if n == 0:
+    if len(comps) < 3:
         return {
-            "title": title,
             "price": None,
-            "comparables": 0,
-            "note": "No comparable vehicles found"
-        }
-
-    if n < 3:
-        return {
-            "title": title,
-            "price": round(comps.price.mean(), 0),
-            "comparables": n,
-            "note": f"Used nearby years {used_years}"
+            "comparables": len(comps),
+            "used_year": used_year,
+            "note": "Not enough data for regression"
         }
 
     lr, scaler, sigma, cols = train_regression(comps)
 
     input_row = pd.DataFrame([{
         "odometer": p.odometer,
-        "year": p.year,
+        "year": used_year,
         "province": province if province else comps.province.mode()[0]
     }])
 
@@ -196,16 +178,17 @@ def estimate_value(p: EstimateRequest):
 
     pred = lr.predict(scaler.transform(input_row))[0]
 
-    t_val = t.ppf((1 + confidence) / 2, df=n - 1)
+    t_val = t.ppf((1 + confidence) / 2, df=len(comps) - 1)
     margin = t_val * sigma
 
     return {
-        "title": title,
+        "requested_year": p.year,
+        "estimated_year": used_year,
         "price": round(pred, 0),
         "low": round(pred - margin, 0),
         "high": round(pred + margin, 0),
-        "comparables": n,
-        "note": f"Used years {used_years}"
+        "comparables": len(comps),
+        "note": f"Estimated using year {used_year}"
     }
 
 # =========================
