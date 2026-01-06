@@ -149,8 +149,9 @@ def estimate_value(p: EstimateRequest):
     comps, used_year = find_nearest_year_data(make, model, p.year)
 
     trim = match_trim(p.trim, make, model)
-    if trim:
-        comps_trim = comps[comps.trim == trim]
+    
+    if trim and "trim" in comps.columns:
+        comps_trim = comps[comps["trim"] == trim]
         if not comps_trim.empty:
             comps = comps_trim
 
@@ -237,4 +238,5 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
+
 
