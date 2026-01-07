@@ -10,7 +10,7 @@ import re
 from collections import defaultdict
 
 CSV_PATH = "test.csv"
-YEAR_RANGE = 2
+YEAR_RANGE = 1
 MILEAGE_RATE = 0.10
 
 app = FastAPI(title="Vehicle Fair Value API")
@@ -273,3 +273,4 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
+
