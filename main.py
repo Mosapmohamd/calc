@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import t
 import re
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 CSV_PATH = "test.csv"
 YEAR_RANGE = 1
@@ -19,16 +20,15 @@ app = FastAPI(title="Vehicle Fair Value API")
 # MODEL ALIASES
 # =========================
 MODEL_ALIASES = {
-    "SLVRDO": "SILVERADO",
-    "SILVRDO": "SILVERADO",
-    "SILVERADO": "SILVERADO",
+    "slvrdo": "silverado",
+    "silvrdo": "silverado",
+    "silverado": "silverado",
 
-    "GRNDCRVN": "GRAND CARAVAN",
-    "GRANDCRVN": "GRAND CARAVAN",
-    "GRAND CARAVAN": "GRAND CARAVAN",
+    "grndcrvn": "grand caravan",
+    "grandcrvn": "grand caravan",
+    "grand caravan": "grand caravan",
 
-    "F150": "F-150",
-    "F 150": "F-150",
+    "f150": "f 150",
 }
 
 # =========================
@@ -37,35 +37,39 @@ MODEL_ALIASES = {
 def norm(s: Optional[str]):
     if not s:
         return None
-    return re.sub(r"[^A-Z0-9\- ]", "", s.upper()).strip()
+    return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+def match_value(value: Optional[str], valid_set: set, threshold: float = 0.6):
+    if not value:
+        return None
+
+    value = norm(value)
+    best_match = None
+    best_score = 0
+
+    for v in valid_set:
+        v_norm = norm(v)
+
+        if value in v_norm or v_norm in value:
+            return v
+
+        score = similarity(value, v_norm)
+        if score > best_score:
+            best_score = score
+            best_match = v
+
+    return best_match if best_score >= threshold else None
 
 def normalize_model(raw: Optional[str]):
     if not raw:
         return None
 
-    cleaned = (
-        raw.upper()
-        .replace("-", " ")
-        .replace("_", " ")
-        .strip()
-    )
-
+    cleaned = norm(raw)
     key = cleaned.replace(" ", "")
     return MODEL_ALIASES.get(key, cleaned)
-
-def match_value(value: Optional[str], valid_set: set):
-    if not value:
-        return None
-
-    value = norm(value)
-    if value in valid_set:
-        return value
-
-    for v in valid_set:
-        if value in v or v in value:
-            return v
-
-    return None
 
 # =========================
 # LOAD DATA
@@ -86,8 +90,13 @@ def load_data(path: str) -> pd.DataFrame:
     for c in ["year", "odometer", "price"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    for c in ["make", "model", "trim", "province"]:
-        df[c] = df[c].astype(str).str.upper().str.strip()
+    cat_cols = ["make", "model", "trim", "province"]
+    for col in cat_cols:
+        df[col] = df[col].astype(str)
+        df[col] = df[col].str.lower()
+        df[col] = df[col].str.strip()
+        df[col] = df[col].str.replace(r"\s+", " ", regex=True)
+        df[col] = df[col].str.replace(r"[^a-z0-9 ]", "", regex=True)
 
     return df.dropna()
 
@@ -117,13 +126,13 @@ class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
 
 # =========================
-# TRIM
+# TRIM MATCH
 # =========================
 def match_trim(trim, make, model):
     if not trim:
         return None
-    trim = norm(trim)
-    return trim if trim in TRIM_MAP.get((make, model), set()) else None
+    trims = TRIM_MAP.get((make, model), set())
+    return match_value(trim, trims)
 
 # =========================
 # FIND NEAREST YEAR DATA
@@ -168,10 +177,8 @@ def estimate_value(p: EstimateRequest):
     confidence = min(max(p.confidence, 0.5), 0.99)
 
     make = match_value(p.make, VALID_MAKES)
-
-    normalized_model = normalize_model(p.model)
-    model = match_value(normalized_model, VALID_MODELS)
-
+    model_norm = normalize_model(p.model)
+    model = match_value(model_norm, VALID_MODELS)
     province = match_value(p.province, VALID_PROVINCES)
 
     if not make or not model:
@@ -179,29 +186,26 @@ def estimate_value(p: EstimateRequest):
             "title": f"{p.year} {p.make} {p.model}",
             "price": None,
             "comparables": 0,
-            "note": "Make or model not found"
+            "note": "make or model not found"
         }
 
     comps, used_year = find_nearest_year_data(make, model, p.year)
 
     trim = match_trim(p.trim, make, model)
-    if trim and "trim" in comps.columns:
-        comps_trim = comps[comps["trim"] == trim]
+    if trim:
+        comps_trim = comps[comps.trim == trim]
         if not comps_trim.empty:
             comps = comps_trim
 
     n = len(comps)
-
-    title = f"{p.year} {make} {model}"
-    if trim:
-        title += f" {trim}"
+    title = f"{p.year} {make} {model}" + (f" {trim}" if trim else "")
 
     if n == 0:
         return {
             "title": title,
             "price": None,
             "comparables": 0,
-            "note": "No comparable vehicles found"
+            "note": "no comparable vehicles"
         }
 
     if n == 1:
@@ -212,7 +216,7 @@ def estimate_value(p: EstimateRequest):
             "estimated_year": used_year,
             "price": round(adj_price, 0),
             "comparables": 1,
-            "note": "Single comparable with mileage adjustment"
+            "note": "single comparable"
         }
 
     if n == 2:
@@ -221,7 +225,7 @@ def estimate_value(p: EstimateRequest):
             "estimated_year": used_year,
             "price": round(comps.price.mean(), 0),
             "comparables": 2,
-            "note": "Average of two comparables"
+            "note": "two comparables average"
         }
 
     lr, scaler, sigma, cols = train_regression(comps)
@@ -243,7 +247,7 @@ def estimate_value(p: EstimateRequest):
             "estimated_year": used_year,
             "price": round(pred, 0),
             "comparables": n,
-            "note": "Low variance"
+            "note": "low variance"
         }
 
     t_val = t.ppf((1 + confidence) / 2, df=n - 1)
@@ -273,4 +277,3 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
-
