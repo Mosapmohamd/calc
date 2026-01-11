@@ -8,60 +8,64 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import t
 import re
 from collections import defaultdict
-import warnings
-warnings.filterwarnings('ignore')
+from difflib import get_close_matches
+import fuzzywuzzy
+from fuzzywuzzy import fuzz, process
 
 CSV_PATH = "test.csv"
-YEAR_RANGE = 2  # Increased for better matching
+YEAR_RANGE = 1
 MILEAGE_RATE = 0.10
+FUZZY_THRESHOLD = 80  # Minimum fuzzy match score (0-100)
 MIN_COMPARABLES_FOR_REGRESSION = 3
 
-app = FastAPI(title="Vehicle Fair Value API", version="2.0")
+app = FastAPI(title="Vehicle Fair Value API")
 
 # =========================
-# MODEL ALIASES
+# MODEL ALIASES (expanded with common variations)
 # =========================
 MODEL_ALIASES = {
     "slvrdo": "silverado",
     "silvrdo": "silverado",
     "silverado": "silverado",
+    "silverad": "silverado",
     
     "grndcrvn": "grand caravan",
     "grandcrvn": "grand caravan",
     "grand caravan": "grand caravan",
+    "grandcaravan": "grand caravan",
     
     "f150": "f-150",
     "f 150": "f-150",
     "f-150": "f-150",
+    "f150xlt": "f-150",
     
     "corolla": "corolla",
     "corola": "corolla",
+    "corolla le": "corolla",
     
     "civic": "civic",
-    "cvic": "civic",
+    "civic lx": "civic",
+    "civic ex": "civic",
     
     "accord": "accord",
     "acord": "accord",
     
     "camry": "camry",
-    "camy": "camry",
+    "camry le": "camry",
 }
 
+# Common manufacturer aliases
 MAKE_ALIASES = {
     "gm": "general motors",
     "gmc": "general motors",
     "chev": "chevrolet",
     "chevy": "chevrolet",
     "vw": "volkswagen",
+    "vwvolkswagen": "volkswagen",
     "toy": "toyota",
     "hon": "honda",
     "for": "ford",
     "niss": "nissan",
-    "bm": "bmw",
-    "merc": "mercedes",
-    "mercdes": "mercedes",
-    "hyun": "hyundai",
-    "hundai": "hyundai",
 }
 
 # =========================
@@ -73,36 +77,44 @@ def clean_string(s: str) -> str:
         return ""
     
     s = str(s)
+    # Convert to lowercase
     s = s.lower()
+    # Strip whitespace
     s = s.strip()
+    # Replace multiple spaces with single space
     s = re.sub(r'\s+', ' ', s)
+    # Remove special characters, keep only a-z, 0-9, and space
     s = re.sub(r'[^a-z0-9 ]', '', s)
     return s
 
 def norm(s: Optional[str]):
-    """Normalize string"""
+    """Normalize string: apply cleaning and return None if empty"""
     if not s:
         return None
     cleaned = clean_string(s)
     return cleaned if cleaned else None
 
 def normalize_model(raw: Optional[str]):
-    """Normalize model name with aliases"""
+    """Normalize model name with aliases and fuzzy matching"""
     if not raw:
         return None
     
+    # Clean the input
     cleaned = clean_string(raw)
     if not cleaned:
         return None
     
-    # Remove spaces for alias matching
-    cleaned_no_spaces = cleaned.replace(" ", "")
-    
     # Check exact aliases first
     for alias, normalized in MODEL_ALIASES.items():
-        if cleaned == alias or cleaned_no_spaces == alias:
+        if cleaned == alias:
             return normalized
     
+    # Check if cleaned is a close match to any alias
+    for alias in MODEL_ALIASES.keys():
+        if fuzz.ratio(cleaned, alias) > FUZZY_THRESHOLD:
+            return MODEL_ALIASES[alias]
+    
+    # Return cleaned version
     return cleaned
 
 def normalize_make(raw: Optional[str]):
@@ -114,16 +126,15 @@ def normalize_make(raw: Optional[str]):
     if not cleaned:
         return None
     
-    cleaned_no_spaces = cleaned.replace(" ", "")
-    
+    # Check aliases
     for alias, normalized in MAKE_ALIASES.items():
-        if cleaned == alias or cleaned_no_spaces == alias:
+        if cleaned == alias:
             return normalized
     
     return cleaned
 
-def find_best_match(value: str, valid_set: set):
-    """Find best match using various strategies"""
+def find_best_match(value: Optional[str], valid_set: set, threshold: int = 80):
+    """Find best fuzzy match in a set of valid values"""
     if not value or not valid_set:
         return None
     
@@ -131,22 +142,73 @@ def find_best_match(value: str, valid_set: set):
     if not value_norm:
         return None
     
-    # 1. Exact match
+    # Check for exact match
     for valid in valid_set:
         if valid == value_norm:
             return valid
     
-    # 2. Substring match
+    # Check for substring match
     for valid in valid_set:
-        if value_norm in valid or valid in value_norm:
+        if valid and value_norm and (value_norm in valid or valid in value_norm):
             return valid
     
-    # 3. Partial word match
-    value_words = set(value_norm.split())
-    for valid in valid_set:
-        valid_words = set(valid.split())
-        if value_words.intersection(valid_words):
+    # Use fuzzy matching
+    if len(valid_set) > 0:
+        # Convert set to list for fuzzy matching
+        valid_list = list(valid_set)
+        # Use fuzzywuzzy to find best match
+        match, score = process.extractOne(value_norm, valid_list)
+        if score >= threshold:
+            return match
+    
+    return None
+
+def match_trim_fuzzy(trim: Optional[str], valid_trims: set, threshold: int = 75):
+    """Fuzzy match for trim levels"""
+    if not trim or not valid_trims:
+        return None
+    
+    trim_norm = norm(trim)
+    if not trim_norm:
+        return None
+    
+    # Check for exact match
+    for valid in valid_trims:
+        if valid == trim_norm:
             return valid
+    
+    # Check for common trim patterns
+    common_patterns = {
+        "base": ["base", "standard"],
+        "lx": ["lx"],
+        "ex": ["ex", "executive"],
+        "le": ["le", "limited edition"],
+        "se": ["se", "special edition"],
+        "xlt": ["xlt"],
+        "lariat": ["lariat"],
+        "platinum": ["platinum"],
+        "limited": ["limited"],
+        "premium": ["premium"],
+        "luxury": ["luxury"],
+        "sport": ["sport"],
+        "touring": ["touring"],
+    }
+    
+    # Check if input matches any common trim pattern
+    for pattern_key, pattern_list in common_patterns.items():
+        for pattern in pattern_list:
+            if pattern in trim_norm:
+                # Look for trims containing this pattern
+                for valid in valid_trims:
+                    if pattern_key in valid:
+                        return valid
+    
+    # Fuzzy match as fallback
+    if len(valid_trims) > 0:
+        valid_list = list(valid_trims)
+        match, score = process.extractOne(trim_norm, valid_list)
+        if score >= threshold:
+            return match
     
     return None
 
@@ -157,106 +219,80 @@ def load_data(path: str) -> pd.DataFrame:
     """Load and clean the CSV data"""
     df = pd.read_csv(path)
 
-    # Standardize column names
-    column_mapping = {}
-    for col in df.columns:
-        col_lower = col.lower().strip()
-        if 'year' in col_lower:
-            column_mapping[col] = 'year'
-        elif 'make' in col_lower:
-            column_mapping[col] = 'make'
-        elif 'model' in col_lower:
-            column_mapping[col] = 'model'
-        elif 'trim' in col_lower:
-            column_mapping[col] = 'trim'
-        elif 'odometer' in col_lower or 'mileage' in col_lower:
-            column_mapping[col] = 'odometer'
-        elif 'price' in col_lower or 'value' in col_lower:
-            column_mapping[col] = 'price'
-        elif 'province' in col_lower or 'state' in col_lower or 'region' in col_lower:
-            column_mapping[col] = 'province'
-    
-    df = df.rename(columns=column_mapping)
+    # Rename columns to standard names
+    df = df.rename(columns={
+        "Year": "year",
+        "Make": "make",
+        "Model": "model",
+        "Trim": "trim",
+        "Odometer": "odometer",
+        "Price": "price",
+        "Province": "province",
+    })
 
-    # Ensure required columns exist
-    required_cols = ['year', 'make', 'model', 'odometer', 'price']
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-    
     # Clean numeric columns
-    for c in ['year', 'odometer', 'price']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
+    for c in ["year", "odometer", "price"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Clean categorical columns (apply your cleaning logic)
+    cat_cols = ["make", "model", "trim", "province"]
     
-    # Clean categorical columns
-    cat_cols = ['make', 'model', 'trim', 'province']
     for col in cat_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str)
-            df[col] = df[col].str.lower()
-            df[col] = df[col].str.strip()
-            df[col] = df[col].str.replace(r'\s+', ' ', regex=True)
-            df[col] = df[col].str.replace(r'[^a-z0-9 ]', '', regex=True)
-            df[col] = df[col].replace('', np.nan)
-            df[col] = df[col].replace('nan', np.nan)
-    
-    # Apply aliases
-    df['make_clean'] = df['make'].apply(lambda x: normalize_make(x) if pd.notna(x) else x)
-    df['model_clean'] = df['model'].apply(lambda x: normalize_model(x) if pd.notna(x) else x)
-    
-    # Use cleaned versions
-    df['make_final'] = df['make_clean'].combine_first(df['make'])
-    df['model_final'] = df['model_clean'].combine_first(df['model'])
-    
+        # Convert to string and apply your cleaning logic
+        df[col] = df[col].astype(str)
+        df[col] = df[col].str.lower()
+        df[col] = df[col].str.strip()
+        df[col] = df[col].str.replace(r'\s+', ' ', regex=True)
+        df[col] = df[col].str.replace(r'[^a-z0-9 ]', '', regex=True)
+        
+        # Replace empty strings with NaN
+        df[col] = df[col].replace('', np.nan)
+
+    # Store original cleaned values
+    for col in cat_cols:
+        df[f"{col}_original"] = df[col]
+
     # Drop rows with missing critical data
-    df = df.dropna(subset=['year', 'make_final', 'model_final', 'odometer', 'price'])
-    
+    critical_cols = ["year", "make", "model", "odometer", "price"]
+    df = df.dropna(subset=critical_cols)
+
     # Reset index
     df = df.reset_index(drop=True)
-    
+
     return df
 
-# Load data
+# Load the data
 try:
     df = load_data(CSV_PATH)
-    print(f"✅ Data loaded: {len(df)} records")
-    
-    # Debug info
-    print(f"   Makes: {df.make_final.nunique()}")
-    print(f"   Models: {df.model_final.nunique()}")
-    print(f"   Years range: {df.year.min()} - {df.year.max()}")
-    print(f"   Price range: ${df.price.min():,.0f} - ${df.price.max():,.0f}")
-    
-except Exception as e:
-    print(f"❌ Error loading data: {e}")
-    df = pd.DataFrame()
+    print(f"Successfully loaded data from {CSV_PATH}")
+    print(f"Data shape: {df.shape}")
+except FileNotFoundError:
+    print(f"Warning: {CSV_PATH} not found. Creating empty dataset for testing.")
+    # Create empty dataframe with expected columns
+    df = pd.DataFrame(columns=[
+        'year', 'make', 'model', 'trim', 'odometer', 'price', 'province',
+        'make_original', 'model_original', 'trim_original', 'province_original'
+    ])
 
-# =========================
-# VALID VALUES SETUP
-# =========================
-VALID_MAKES = set(df['make_final'].unique()) if len(df) > 0 else set()
-VALID_MODELS = set(df['model_final'].unique()) if len(df) > 0 else set()
-VALID_PROVINCES = set(df['province'].unique()) if 'province' in df.columns and len(df) > 0 else set()
-
-# Build year ranges for each make-model
-MAKE_MODEL_YEARS = {}
-if len(df) > 0:
-    for (make, model), group in df.groupby(['make_final', 'model_final']):
-        MAKE_MODEL_YEARS[(make, model)] = {
-            'min_year': group['year'].min(),
-            'max_year': group['year'].max(),
-            'years': sorted(group['year'].unique())
-        }
+# Store both cleaned and original values
+VALID_MAKES = {make: make for make in df.make_original.unique() if pd.notna(make)} if len(df) > 0 else {}
+VALID_MODELS = {model: model for model in df.model_original.unique() if pd.notna(model)} if len(df) > 0 else {}
+VALID_PROVINCES = {prov: prov for prov in df.province_original.unique() if pd.notna(prov)} if len(df) > 0 else {}
 
 # Build trim mapping
 TRIM_MAP = defaultdict(set)
-if len(df) > 0 and 'trim' in df.columns:
-    for _, row in df.iterrows():
-        make = row['make_final']
-        model = row['model_final']
-        trim = row['trim']
-        if pd.notna(trim):
-            TRIM_MAP[(make, model)].add(trim)
+if len(df) > 0:
+    for _, r in df.iterrows():
+        make_norm = r.make_original
+        model_norm = r.model_original
+        trim_val = r.trim_original
+        if pd.notna(make_norm) and pd.notna(model_norm) and pd.notna(trim_val):
+            TRIM_MAP[(make_norm, model_norm)].add(trim_val)
+
+print(f"Loaded {len(df)} records")
+print(f"Unique makes: {len(VALID_MAKES)}")
+print(f"Unique models: {len(VALID_MODELS)}")
+print(f"Unique provinces: {len(VALID_PROVINCES)}")
 
 # =========================
 # REQUEST MODELS
@@ -273,417 +309,373 @@ class EstimateRequest(BaseModel):
 class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
 
-class PredictionResult(BaseModel):
-    features: dict
-    coefficients: Optional[dict]
-    predictions: List[dict]
-
 # =========================
-# MATCHING FUNCTIONS
+# UPDATED MATCHING FUNCTIONS
 # =========================
 def match_make(make_input: str) -> Optional[str]:
-    """Match manufacturer"""
+    """Match manufacturer with fuzzy logic"""
     make_norm = normalize_make(make_input)
-    if not make_norm:
-        return None
-    return find_best_match(make_norm, VALID_MAKES)
+    return find_best_match(make_norm, set(VALID_MAKES.keys()))
 
-def match_model(model_input: str, make_matched: str) -> Optional[str]:
-    """Match model for specific make"""
-    if not make_matched:
-        return None
-    
+def match_model(model_input: str, make_matched: Optional[str] = None) -> Optional[str]:
+    """Match model with fuzzy logic"""
     model_norm = normalize_model(model_input)
-    if not model_norm:
-        return None
     
-    # Get models for this specific make
-    make_models = df[df['make_final'] == make_matched]['model_final'].unique()
-    valid_models_for_make = set(make_models)
+    # If we have a make, filter models by that make
+    if make_matched:
+        # Get all models for this make
+        make_models = df[df.make_original == make_matched].model_original.unique()
+        valid_models_for_make = {model: model for model in make_models if pd.notna(model)}
+        matched = find_best_match(model_norm, set(valid_models_for_make.keys()))
+        if matched:
+            return valid_models_for_make[matched]
     
-    return find_best_match(model_norm, valid_models_for_make)
+    # Fallback to all models
+    return find_best_match(model_norm, set(VALID_MODELS.keys()))
 
 def match_province(province_input: Optional[str]) -> Optional[str]:
-    """Match province"""
+    """Match province with fuzzy logic"""
     if not province_input:
         return None
-    province_norm = norm(province_input)
-    if not province_norm:
+    return find_best_match(province_input, set(VALID_PROVINCES.keys()))
+
+def match_trim(trim_input: Optional[str], make: str, model: str) -> Optional[str]:
+    """Match trim with fuzzy logic for specific make/model"""
+    if not trim_input or not make or not model:
         return None
-    return find_best_match(province_norm, VALID_PROVINCES)
+    
+    if (make, model) not in TRIM_MAP:
+        return None
+    
+    valid_trims = TRIM_MAP[(make, model)]
+    return match_trim_fuzzy(trim_input, valid_trims)
 
 # =========================
-# DATA COLLECTION FOR REGRESSION
+# FIND NEAREST YEAR DATA
 # =========================
-def get_comparable_data(make: str, model: str, target_year: int):
-    """Get all comparable data for regression training"""
-    # First, try exact year
-    comps = df[
-        (df['make_final'] == make) & 
-        (df['model_final'] == model) & 
-        (df['year'] == target_year)
-    ]
-    
-    # If not enough data, expand to nearby years
-    if len(comps) < MIN_COMPARABLES_FOR_REGRESSION:
-        for year_diff in range(1, YEAR_RANGE + 1):
-            years_to_try = [target_year + year_diff, target_year - year_diff]
-            for year in years_to_try:
-                additional = df[
-                    (df['make_final'] == make) & 
-                    (df['model_final'] == model) & 
-                    (df['year'] == year)
-                ]
-                comps = pd.concat([comps, additional])
-                
-                if len(comps) >= MIN_COMPARABLES_FOR_REGRESSION * 2:  # Get more for robustness
-                    break
-            if len(comps) >= MIN_COMPARABLES_FOR_REGRESSION * 2:
-                break
-    
-    return comps
+def find_nearest_year_data(make, model, target_year):
+    """Find comparable data for the nearest available year"""
+    for d in range(0, YEAR_RANGE + 1):
+        years = [target_year] if d == 0 else [target_year + d, target_year - d]
+        for y in years:
+            # Filter by make and model (already cleaned)
+            comps = df[
+                (df.make_original == make) &
+                (df.model_original == model) &
+                (df.year == y)
+            ]
+            if not comps.empty:
+                return comps, y
+    return pd.DataFrame(), None
 
 # =========================
-# REGRESSION MODEL
+# IMPROVED REGRESSION WITH BETTER ERROR HANDLING
 # =========================
-def train_price_regression(comps_df):
-    """Train regression model to predict price based on features"""
-    if len(comps_df) < MIN_COMPARABLES_FOR_REGRESSION:
-        return None, None, None, None, None
+def train_regression(sub_df):
+    """Train regression model with robust error handling"""
+    if len(sub_df) < MIN_COMPARABLES_FOR_REGRESSION:
+        return None, None, None, None
     
     try:
-        # Prepare features
-        X = comps_df[['odometer', 'year']].copy()
+        X = sub_df[["odometer", "year"]].copy()
         
         # Add province if available and has variation
-        if 'province' in comps_df.columns and comps_df['province'].nunique() > 1:
-            # Get top provinces (remove rare ones)
-            province_counts = comps_df['province'].value_counts()
+        if ("province_original" in sub_df.columns and 
+            sub_df.province_original.notna().any() and
+            sub_df.province_original.nunique() > 1):
+            
+            # Filter out rare provinces (less than 2 occurrences)
+            province_counts = sub_df.province_original.value_counts()
             common_provinces = province_counts[province_counts >= 2].index.tolist()
             
             if common_provinces:
+                # Create province indicator for common provinces
                 for province in common_provinces:
-                    X[f'province_{province}'] = (comps_df['province'] == province).astype(int)
+                    X[f"province_{province}"] = (sub_df.province_original == province).astype(int)
+        else:
+            # Add constant column if no province info
+            X["constant"] = 1
         
-        # Add trim if available
-        if 'trim' in comps_df.columns and comps_df['trim'].nunique() > 1:
-            trim_counts = comps_df['trim'].value_counts()
-            common_trims = trim_counts[trim_counts >= 2].index.tolist()
-            
-            if common_trims:
-                for trim in common_trims:
-                    if pd.notna(trim):
-                        X[f'trim_{clean_string(trim)}'] = (comps_df['trim'] == trim).astype(int)
+        y = sub_df["price"].values
         
-        y = comps_df['price'].values
+        # Check for sufficient variation in features
+        if len(X) < len(X.columns) + 1:
+            return None, None, None, None
         
-        # Remove columns with no variation
+        # Remove constant columns
         X = X.loc[:, X.nunique() > 1]
         
-        if len(X.columns) == 0 or len(X) < len(X.columns) + 2:
-            return None, None, None, None, None
+        if len(X.columns) == 0:
+            return None, None, None, None
         
-        # Scale features
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
         
-        # Train model
         model = LinearRegression()
         model.fit(X_scaled, y)
         
-        # Calculate statistics
-        y_pred = model.predict(X_scaled)
-        residuals = y - y_pred
-        sigma = np.std(residuals, ddof=max(1, len(X.columns)))
-        r_squared = model.score(X_scaled, y)
+        residuals = y - model.predict(X_scaled)
+        sigma = np.std(residuals, ddof=1) if len(residuals) > 1 else 0
         
-        # Get feature names
-        feature_names = X.columns.tolist()
-        
-        # Get coefficients
-        coefficients = dict(zip(feature_names, model.coef_))
-        if hasattr(model, 'intercept_'):
-            coefficients['intercept'] = model.intercept_
-        
-        return model, scaler, sigma, r_squared, coefficients
+        return model, scaler, sigma, X.columns.tolist()
     
     except Exception as e:
-        print(f"Regression training error: {e}")
-        return None, None, None, None, None
-
-def predict_price(model, scaler, features_dict, feature_names):
-    """Predict price using trained model"""
-    try:
-        # Create input DataFrame
-        input_df = pd.DataFrame([features_dict])
-        
-        # Ensure all feature columns exist
-        for feature in feature_names:
-            if feature not in input_df.columns:
-                input_df[feature] = 0
-        
-        # Reorder to match training
-        input_df = input_df[feature_names]
-        
-        # Scale and predict
-        X_scaled = scaler.transform(input_df)
-        prediction = model.predict(X_scaled)[0]
-        
-        return max(prediction, 0)  # Ensure non-negative
-    
-    except Exception as e:
-        print(f"Prediction error: {e}")
-        return None
+        print(f"Regression training failed: {e}")
+        return None, None, None, None
 
 # =========================
-# CORE ESTIMATION LOGIC
+# CORE LOGIC WITH IMPROVED ERROR HANDLING
 # =========================
-def estimate_value(request: EstimateRequest):
-    """Main estimation function"""
-    # Normalize inputs
-    make_input = request.make
-    model_input = request.model
-    year_input = request.year
-    odometer_input = request.odometer
-    province_input = request.province
-    trim_input = request.trim
-    confidence = min(max(request.confidence, 0.5), 0.99)
-    
-    # Match make and model
-    make_matched = match_make(make_input)
-    model_matched = match_model(model_input, make_matched) if make_matched else None
-    
+def estimate_value(p: EstimateRequest):
+    confidence = min(max(p.confidence, 0.5), 0.99)
+
+    # Use fuzzy matching for all fields
+    make_matched = match_make(p.make)
+    model_matched = match_model(p.model, make_matched)
+    province_matched = match_province(p.province)
+
     if not make_matched or not model_matched:
         return {
-            "success": False,
-            "title": f"{year_input} {make_input} {model_input}",
-            "message": f"Make or model not found. Make: '{make_input}', Model: '{model_input}'",
-            "matched_make": make_matched,
-            "matched_model": model_matched,
-            "comparables": 0
+            "title": f"{p.year} {p.make} {p.model}",
+            "price": None,
+            "comparables": 0,
+            "note": f"Make or model not found. Make: {p.make}, Model: {p.model}",
+            "status": "error"
         }
+
+    # Get display values
+    make_display = make_matched.title() if make_matched else p.make
+    model_display = model_matched.title() if model_matched else p.model
+
+    comps, used_year = find_nearest_year_data(make_matched, model_matched, p.year)
+
+    # Try to match trim if provided
+    trim_matched = None
+    if p.trim:
+        trim_matched = match_trim(p.trim, make_matched, model_matched)
+        if trim_matched and "trim_original" in comps.columns:
+            comps_trim = comps[comps["trim_original"] == trim_matched]
+            if not comps_trim.empty:
+                comps = comps_trim
+
+    n = len(comps)
+
+    # Build title with matched values
+    title = f"{p.year} {make_display} {model_display}"
+    if trim_matched:
+        title += f" {trim_matched.title()}"
+
+    if n == 0:
+        return {
+            "title": title,
+            "price": None,
+            "comparables": 0,
+            "note": "No comparable vehicles found",
+            "matched_make": make_display,
+            "matched_model": model_display,
+            "matched_trim": trim_matched.title() if trim_matched else None,
+            "status": "no_comparables"
+        }
+
+    if n == 1:
+        base = comps.iloc[0]
+        adj_price = base.price - (p.odometer - base.odometer) * MILEAGE_RATE
+        return {
+            "title": title,
+            "estimated_year": used_year,
+            "price": round(max(adj_price, 0), 0),  # Ensure non-negative price
+            "comparables": 1,
+            "note": "Single comparable with mileage adjustment",
+            "matched_make": make_display,
+            "matched_model": model_display,
+            "matched_trim": trim_matched.title() if trim_matched else None,
+            "status": "single_comparable"
+        }
+
+    if n == 2:
+        avg_price = comps.price.mean()
+        return {
+            "title": title,
+            "estimated_year": used_year,
+            "price": round(avg_price, 0),
+            "comparables": 2,
+            "note": "Average of two comparables",
+            "matched_make": make_display,
+            "matched_model": model_display,
+            "matched_trim": trim_matched.title() if trim_matched else None,
+            "status": "two_comparables"
+        }
+
+    # Try regression if we have enough comparables
+    lr, scaler, sigma, cols = train_regression(comps)
     
-    # Match province
-    province_matched = match_province(province_input) if province_input else None
-    
-    # Get comparable data
-    comps = get_comparable_data(make_matched, model_matched, year_input)
-    
-    if len(comps) == 0:
-        # Check available years for this make-model
-        key = (make_matched, model_matched)
-        if key in MAKE_MODEL_YEARS:
-            years_info = MAKE_MODEL_YEARS[key]
+    if lr is None:
+        # Fallback to mean price
+        avg_price = comps.price.mean()
+        return {
+            "title": title,
+            "estimated_year": used_year,
+            "price": round(avg_price, 0),
+            "comparables": n,
+            "note": "Regression not possible, using mean price",
+            "matched_make": make_display,
+            "matched_model": model_display,
+            "matched_trim": trim_matched.title() if trim_matched else None,
+            "status": "mean_fallback"
+        }
+
+    try:
+        # Prepare input for prediction
+        input_data = {}
+        
+        # Add base features
+        input_data["odometer"] = p.odometer
+        input_data["year"] = used_year
+        
+        # Add province features if present
+        for col in cols:
+            if col.startswith("province_"):
+                province_name = col.replace("province_", "")
+                input_data[col] = 1 if province_matched == province_name else 0
+            elif col == "constant":
+                input_data[col] = 1
+        
+        # Create input row with all columns
+        input_row = pd.DataFrame([input_data])
+        
+        # Ensure all required columns are present
+        for col in cols:
+            if col not in input_row.columns:
+                input_row[col] = 0
+        
+        # Reorder columns to match training data
+        input_row = input_row[cols]
+        
+        # Make prediction
+        X_scaled = scaler.transform(input_row)
+        pred = lr.predict(X_scaled)[0]
+        
+        # Ensure non-negative prediction
+        pred = max(pred, 0)
+        
+        if sigma == 0 or not np.isfinite(sigma) or n <= len(cols):
             return {
-                "success": False,
-                "title": f"{year_input} {make_matched} {model_matched}",
-                "message": f"No data found for year {year_input}. Available years: {years_info['years']}",
-                "matched_make": make_matched,
-                "matched_model": model_matched,
-                "available_years": years_info['years'],
-                "comparables": 0
+                "title": title,
+                "estimated_year": used_year,
+                "price": round(pred, 0),
+                "comparables": n,
+                "note": "Prediction with limited confidence",
+                "matched_make": make_display,
+                "matched_model": model_display,
+                "matched_trim": trim_matched.title() if trim_matched else None,
+                "status": "regression_limited"
             }
-        else:
-            return {
-                "success": False,
-                "title": f"{year_input} {make_matched} {model_matched}",
-                "message": "No comparable data found",
-                "matched_make": make_matched,
-                "matched_model": model_matched,
-                "comparables": 0
-            }
-    
-    # Prepare title
-    title = f"{year_input} {make_matched.title()} {model_matched.title()}"
-    if trim_input:
-        title += f" {trim_input.title()}"
-    
-    # If we have only 1-2 comparables, use simple average
-    if len(comps) < MIN_COMPARABLES_FOR_REGRESSION:
-        if len(comps) == 1:
-            base = comps.iloc[0]
-            adj_price = base['price'] - (odometer_input - base['odometer']) * MILEAGE_RATE
-            price = max(adj_price, 0)
-            method = "single_comparable_adjusted"
-        else:  # 2 comparables
-            avg_price = comps['price'].mean()
-            # Adjust for average odometer difference
-            avg_odometer = comps['odometer'].mean()
-            adj_price = avg_price - (odometer_input - avg_odometer) * MILEAGE_RATE
-            price = max(adj_price, 0)
-            method = "average_adjusted"
+        
+        # Calculate confidence interval
+        t_val = t.ppf((1 + confidence) / 2, df=max(1, n - len(cols) - 1))
+        margin = t_val * sigma
         
         return {
-            "success": True,
             "title": title,
-            "estimated_price": round(price, 2),
-            "method": method,
-            "comparables": len(comps),
-            "matched_make": make_matched,
-            "matched_model": model_matched,
-            "matched_province": province_matched,
-            "features_used": ["odometer", "year"],
-            "confidence": confidence,
-            "data_summary": {
-                "years_used": sorted(comps['year'].unique()),
-                "odometer_range": [comps['odometer'].min(), comps['odometer'].max()],
-                "price_range": [comps['price'].min(), comps['price'].max()]
-            }
+            "estimated_year": used_year,
+            "price": round(pred, 0),
+            "low": round(max(pred - margin, 0), 0),
+            "high": round(pred + margin, 0),
+            "comparables": n,
+            "note": None,
+            "matched_make": make_display,
+            "matched_model": model_display,
+            "matched_trim": trim_matched.title() if trim_matched else None,
+            "confidence_interval": f"{confidence*100:.0f}%",
+            "status": "success"
         }
     
-    # Train regression model
-    model, scaler, sigma, r_squared, coefficients = train_price_regression(comps)
-    
-    if model is None:
-        # Fallback to median with adjustment
-        median_price = comps['price'].median()
-        median_odometer = comps['odometer'].median()
-        adj_price = median_price - (odometer_input - median_odometer) * MILEAGE_RATE
-        price = max(adj_price, 0)
-        
+    except Exception as e:
+        # Fallback to mean if prediction fails
+        avg_price = comps.price.mean()
         return {
-            "success": True,
             "title": title,
-            "estimated_price": round(price, 2),
-            "method": "median_adjusted",
-            "comparables": len(comps),
-            "matched_make": make_matched,
-            "matched_model": model_matched,
-            "matched_province": province_matched,
-            "message": "Regression not possible, using median",
-            "data_summary": {
-                "years_used": sorted(comps['year'].unique()),
-                "odometer_range": [comps['odometer'].min(), comps['odometer'].max()],
-                "price_range": [comps['price'].min(), comps['price'].max()]
-            }
+            "estimated_year": used_year,
+            "price": round(avg_price, 0),
+            "comparables": n,
+            "note": f"Prediction failed: {str(e)[:50]}",
+            "matched_make": make_display,
+            "matched_model": model_display,
+            "matched_trim": trim_matched.title() if trim_matched else None,
+            "status": "prediction_error"
         }
-    
-    # Prepare features for prediction
-    features = {
-        'odometer': odometer_input,
-        'year': year_input
-    }
-    
-    # Add province features
-    if province_matched:
-        province_features = [col for col in scaler.feature_names_in_ if col.startswith('province_')]
-        for prov_feature in province_features:
-            province_name = prov_feature.replace('province_', '')
-            features[prov_feature] = 1 if province_matched == province_name else 0
-    
-    # Add trim features
-    if trim_input:
-        trim_clean = clean_string(trim_input)
-        trim_features = [col for col in scaler.feature_names_in_ if col.startswith('trim_')]
-        for trim_feature in trim_features:
-            trim_name = trim_feature.replace('trim_', '')
-            features[trim_feature] = 1 if trim_clean == trim_name else 0
-    
-    # Make prediction
-    predicted_price = predict_price(model, scaler, features, scaler.feature_names_in_.tolist())
-    
-    if predicted_price is None:
-        # Fallback to mean
-        mean_price = comps['price'].mean()
-        return {
-            "success": True,
-            "title": title,
-            "estimated_price": round(mean_price, 2),
-            "method": "mean_fallback",
-            "comparables": len(comps),
-            "matched_make": make_matched,
-            "matched_model": model_matched,
-            "message": "Prediction failed, using mean"
-        }
-    
-    # Calculate confidence interval
-    result = {
-        "success": True,
-        "title": title,
-        "estimated_price": round(predicted_price, 2),
-        "method": "regression",
-        "comparables": len(comps),
-        "matched_make": make_matched,
-        "matched_model": model_matched,
-        "matched_province": province_matched,
-        "r_squared": round(r_squared, 3),
-        "coefficients": coefficients,
-        "features_used": scaler.feature_names_in_.tolist(),
-        "confidence": confidence,
-        "data_summary": {
-            "years_used": sorted(comps['year'].unique()),
-            "odometer_range": [comps['odometer'].min(), comps['odometer'].max()],
-            "price_range": [comps['price'].min(), comps['price'].max()],
-            "training_years_range": [comps['year'].min(), comps['year'].max()]
-        }
-    }
-    
-    # Add confidence interval if we have enough data
-    if sigma > 0 and len(comps) > len(scaler.feature_names_in_) + 1:
-        try:
-            t_val = t.ppf((1 + confidence) / 2, df=len(comps) - len(scaler.feature_names_in_) - 1)
-            margin = t_val * sigma
-            
-            result["confidence_interval"] = {
-                "lower": round(max(predicted_price - margin, 0), 2),
-                "upper": round(predicted_price + margin, 2),
-                "margin": round(margin, 2)
-            }
-        except:
-            pass
-    
-    return result
 
 # =========================
-# API ROUTES
+# ROUTES
 # =========================
 @app.get("/")
-async def root():
-    """Root endpoint with API info"""
+def health():
     return {
-        "name": "Vehicle Fair Value API",
-        "version": "2.0",
-        "description": "Predict vehicle prices using regression on comparable data",
-        "endpoints": {
-            "/": "This info",
-            "/estimate": "POST - Estimate single vehicle",
-            "/estimate/batch": "POST - Estimate multiple vehicles",
-            "/stats": "GET - Dataset statistics",
-            "/search/{make}": "GET - Search for models by make",
-            "/models/{make}/{model}": "GET - Get model details"
-        }
+        "status": "ok", 
+        "fuzzy_matching": "enabled",
+        "data_records": len(df),
+        "makes_available": len(VALID_MAKES),
+        "models_available": len(VALID_MODELS)
     }
 
-@app.post("/estimate", response_model=dict)
-async def estimate_vehicle(request: EstimateRequest):
-    """Estimate value for a single vehicle"""
-    return estimate_value(request)
+@app.post("/estimate")
+def estimate(p: EstimateRequest):
+    return estimate_value(p)
 
-@app.post("/estimate/batch", response_model=List[dict])
-async def estimate_batch(request: BatchEstimateRequest):
-    """Estimate values for multiple vehicles"""
-    return [estimate_value(v) for v in request.vehicles]
+@app.post("/estimate/batch")
+def estimate_batch(p: BatchEstimateRequest):
+    return [estimate_value(v) for v in p.vehicles]
 
-# =========================
-# PREDICTION TEST ENDPOINT
-# =========================
-@app.post("/predict/test")
-async def test_prediction(request: EstimateRequest):
-    """Test endpoint to see prediction details"""
-    result = estimate_value(request)
+@app.get("/valid-values")
+def get_valid_values():
+    """Endpoint to see what valid values are in the dataset"""
+    return {
+        "makes": sorted(list(VALID_MAKES.keys())),
+        "models": sorted(list(VALID_MODELS.keys())),
+        "provinces": sorted(list(VALID_PROVINCES.keys())),
+        "count": len(df)
+    }
+
+@app.get("/search/{make}/{model}")
+def search_models(make: str, model: str):
+    """Search for specific make/model combinations"""
+    make_matched = match_make(make)
+    results = []
     
-    # Add additional debug info
-    if result.get("success"):
-        make_matched = result.get("matched_make")
-        model_matched = result.get("matched_model")
+    if make_matched:
+        # Get all models for this make
+        make_models = df[df.make_original == make_matched].model_original.unique()
+        model_matches = process.extract(norm(model) or "", make_models, limit=10)
         
-        if make_matched and model_matched:
-            # Get sample of training data
-            comps = get_comparable_data(make_matched, model_matched, request.year)
-            
-            if len(comps) > 0:
-                sample_data = comps[['year', 'odometer', 'price']].head(5).to_dict(orient='records')
-                result["sample_training_data"] = sample_data
-                result["training_data_shape"] = comps.shape
+        for model_match, score in model_matches:
+            if score > 60:
+                count = len(df[(df.make_original == make_matched) & (df.model_original == model_match)])
+                results.append({
+                    "model": model_match,
+                    "score": score,
+                    "count": count,
+                    "years_available": df[(df.make_original == make_matched) & 
+                                          (df.model_original == model_match)].year.unique().tolist()
+                })
     
-    return result
+    return {"make": make_matched, "matches": results}
+
+@app.get("/sample/{make}/{model}")
+def get_sample_data(make: str, model: str, limit: int = 5):
+    """Get sample data for a specific make/model"""
+    make_matched = match_make(make)
+    model_matched = match_model(model, make_matched)
+    
+    if not make_matched or not model_matched:
+        return {"error": "Make or model not found"}
+    
+    sample = df[
+        (df.make_original == make_matched) & 
+        (df.model_original == model_matched)
+    ].head(limit)
+    
+    return {
+        "make": make_matched,
+        "model": model_matched,
+        "sample": sample[["year", "odometer", "price", "province_original", "trim_original"]].to_dict(orient="records")
+    }
