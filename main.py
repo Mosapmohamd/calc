@@ -581,6 +581,7 @@ from fuzzywuzzy import fuzz, process
 CSV_PATH = "test.csv"
 FUZZY_THRESHOLD = 80
 MIN_SAMPLES = 3
+YEAR_WINDOW = 3
 
 app = FastAPI(title="Vehicle Price Prediction API")
 
@@ -645,6 +646,27 @@ class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
 
 # =========================
+# DATA SELECTION
+# =========================
+def get_comparables(make: str, model: str, target_year: int) -> pd.DataFrame:
+    base = df[(df.make == make) & (df.model == model)]
+
+    if base.empty:
+        return base
+
+    same_year = base[base.year == target_year]
+    if len(same_year) >= MIN_SAMPLES:
+        return same_year
+
+    years = sorted(base.year.unique())
+    for d in range(1, YEAR_WINDOW + 1):
+        near = base[base.year.isin([target_year - d, target_year + d])]
+        if len(near) >= MIN_SAMPLES:
+            return near
+
+    return base
+
+# =========================
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
@@ -652,25 +674,18 @@ def estimate_value(p: EstimateRequest):
     model_in = clean(p.model)
     province_in = clean(p.province)
 
-    makes = df.make.unique().tolist()
-    make_matched = fuzzy_match(make_in, makes, FUZZY_THRESHOLD)
-
+    make_matched = fuzzy_match(make_in, df.make.unique().tolist())
     if not make_matched:
-        return {
-            "status": "error",
-            "note": "make not found"
-        }
+        return {"status": "error", "note": "make not found"}
 
-    models = df[df.make == make_matched].model.unique().tolist()
-    model_matched = fuzzy_match(model_in, models, FUZZY_THRESHOLD)
-
+    model_matched = fuzzy_match(
+        model_in,
+        df[df.make == make_matched].model.unique().tolist()
+    )
     if not model_matched:
-        return {
-            "status": "error",
-            "note": "model not found"
-        }
+        return {"status": "error", "note": "model not found"}
 
-    comps = df[(df.make == make_matched) & (df.model == model_matched)]
+    comps = get_comparables(make_matched, model_matched, p.year)
 
     if len(comps) < MIN_SAMPLES:
         return {
@@ -685,15 +700,15 @@ def estimate_value(p: EstimateRequest):
     X = comps[["odometer", "year"]].copy()
 
     if comps.province.notna().any() and comps.province.nunique() > 1:
-        province_dummies = pd.get_dummies(comps.province, prefix="province")
-        X = pd.concat([X, province_dummies], axis=1)
+        dummies = pd.get_dummies(comps.province, prefix="province")
+        X = pd.concat([X, dummies], axis=1)
 
     y = comps.price.values
 
     if len(X) <= X.shape[1]:
         return {
             "status": "error",
-            "note": "insufficient feature variation"
+            "note": "invalid regression matrix"
         }
 
     scaler = StandardScaler()
@@ -732,6 +747,7 @@ def estimate_value(p: EstimateRequest):
         "title": f"{p.year} {make_matched.title()} {model_matched.title()}",
         "price": round(price, 0),
         "comparables": len(comps),
+        "used_years": sorted(comps.year.unique().tolist()),
         "features": list(X.columns)
     }
 
