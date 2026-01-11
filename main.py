@@ -20,15 +20,13 @@ app = FastAPI(title="Vehicle Fair Value API")
 # MODEL ALIASES
 # =========================
 MODEL_ALIASES = {
+    "f150": "f150",
     "slvrdo": "silverado",
     "silvrdo": "silverado",
     "silverado": "silverado",
-
-    "grndcrvn": "grand caravan",
-    "grandcrvn": "grand caravan",
-    "grand caravan": "grand caravan",
-
-    "f150": "f 150",
+    "grndcrvn": "grandcaravan",
+    "grandcrvn": "grandcaravan",
+    "grandcaravan": "grandcaravan",
 }
 
 # =========================
@@ -37,7 +35,7 @@ MODEL_ALIASES = {
 def norm(s: Optional[str]):
     if not s:
         return None
-    return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
@@ -53,7 +51,7 @@ def match_value(value: Optional[str], valid_set: set, threshold: float = 0.6):
     for v in valid_set:
         v_norm = norm(v)
 
-        if value in v_norm or v_norm in value:
+        if value == v_norm:
             return v
 
         score = similarity(value, v_norm)
@@ -66,10 +64,8 @@ def match_value(value: Optional[str], valid_set: set, threshold: float = 0.6):
 def normalize_model(raw: Optional[str]):
     if not raw:
         return None
-
-    cleaned = norm(raw)
-    key = cleaned.replace(" ", "")
-    return MODEL_ALIASES.get(key, cleaned)
+    key = norm(raw)
+    return MODEL_ALIASES.get(key, key)
 
 # =========================
 # LOAD DATA
@@ -94,9 +90,7 @@ def load_data(path: str) -> pd.DataFrame:
     for col in cat_cols:
         df[col] = df[col].astype(str)
         df[col] = df[col].str.lower()
-        df[col] = df[col].str.strip()
-        df[col] = df[col].str.replace(r"\s+", " ", regex=True)
-        df[col] = df[col].str.replace(r"[^a-z0-9 ]", "", regex=True)
+        df[col] = df[col].str.replace(r"[^a-z0-9]", "", regex=True)
 
     return df.dropna()
 
