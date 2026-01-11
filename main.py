@@ -687,10 +687,3 @@ async def test_prediction(request: EstimateRequest):
                 result["training_data_shape"] = comps.shape
     
     return result
-
-# =========================
-# RUN APPLICATION
-# =========================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
