@@ -10,8 +10,8 @@ from fuzzywuzzy import fuzz, process
 
 CSV_PATH = "test.csv"
 FUZZY_THRESHOLD = 80
-MIN_SAMPLES = 3
-YEAR_WINDOW = 2
+MIN_SAMPLES = 2
+YEAR_DELTA = 2
 
 app = FastAPI(title="Vehicle Price Prediction API")
 
@@ -78,25 +78,6 @@ class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
 
 # =========================
-# DATA SELECTION
-# =========================
-def get_comparables(make, model, year):
-    base = df[(df.make == make) & (df.model == model)]
-    if base.empty:
-        return base
-
-    same_year = base[base.year == year]
-    if len(same_year) >= MIN_SAMPLES:
-        return same_year
-
-    for d in range(1, YEAR_WINDOW + 1):
-        near = base[base.year.isin([year - d, year + d])]
-        if len(near) >= MIN_SAMPLES:
-            return near
-
-    return base
-
-# =========================
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
@@ -111,11 +92,17 @@ def estimate_value(p: EstimateRequest):
     if not model:
         return {"status": "error", "note": "model not found"}
 
-    comps = get_comparables(make, model, p.year)
+    # =========================
+    # STRICT YEAR WINDOW ±2
+    # =========================
+    comps = df[
+        (df.make == make) &
+        (df.model == model) &
+        (df.year >= p.year - YEAR_DELTA) &
+        (df.year <= p.year + YEAR_DELTA)
+    ]
 
-    # =========================
-    # TRIM FILTER (OPTIONAL)
-    # =========================
+    # Optional trim filter
     trim = clean(p.trim)
     if trim and "trim" in comps.columns:
         trimmed = comps[comps.trim == trim]
@@ -125,15 +112,18 @@ def estimate_value(p: EstimateRequest):
     if len(comps) < MIN_SAMPLES:
         return {
             "status": "no_comparables",
-            "comparables": len(comps)
+            "comparables": len(comps),
+            "used_years": sorted(comps.year.unique().tolist())
         }
 
     # =========================
-    # FEATURES
+    # FEATURES (SAFE)
     # =========================
     X = comps[["odometer", "year"]].copy()
+    y = comps.price.values
 
-    if comps.province.notna().any():
+    # province يدخل فقط لو الداتا كفاية
+    if len(comps) >= 5 and comps.province.notna().any():
         counts = comps.province.value_counts()
         valid = counts[counts >= 2].index.tolist()
 
@@ -144,14 +134,6 @@ def estimate_value(p: EstimateRequest):
             )
             dummies = pd.get_dummies(prov, prefix="province")
             X = pd.concat([X, dummies], axis=1)
-
-    y = comps.price.values
-
-    if len(X) <= X.shape[1]:
-        return {
-            "status": "error",
-            "note": "invalid regression matrix"
-        }
 
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
@@ -208,4 +190,3 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
-
