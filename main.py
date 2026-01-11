@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional, List
 import pandas as pd
-import numpy as np
 import re
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
@@ -57,8 +56,7 @@ def load_data(path: str) -> pd.DataFrame:
         df[c] = df[c].apply(clean)
 
     df = df.dropna(subset=["year", "make", "model", "odometer", "price"])
-    df = df.reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
 
 df = load_data(CSV_PATH)
 
@@ -72,7 +70,6 @@ class EstimateRequest(BaseModel):
     odometer: int
     trim: Optional[str] = None
     province: Optional[str] = None
-    confidence: Optional[float] = 0.9
 
 class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
@@ -93,7 +90,7 @@ def estimate_value(p: EstimateRequest):
         return {"status": "error", "note": "model not found"}
 
     # =========================
-    # STRICT YEAR WINDOW ±2
+    # COMPARABLES MODE ±2 YEARS
     # =========================
     comps = df[
         (df.make == make) &
@@ -102,38 +99,52 @@ def estimate_value(p: EstimateRequest):
         (df.year <= p.year + YEAR_DELTA)
     ]
 
-    # Optional trim filter
     trim = clean(p.trim)
     if trim and "trim" in comps.columns:
         trimmed = comps[comps.trim == trim]
         if len(trimmed) >= MIN_SAMPLES:
             comps = trimmed
 
-    if len(comps) < MIN_SAMPLES:
+    if len(comps) >= MIN_SAMPLES:
+        X = comps[["odometer", "year"]].copy()
+        y = comps.price.values
+
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+
+        lr = LinearRegression()
+        lr.fit(Xs, y)
+
+        input_df = pd.DataFrame([{
+            "odometer": p.odometer,
+            "year": p.year
+        }])
+
+        price = lr.predict(scaler.transform(input_df))[0]
+
         return {
-            "status": "no_comparables",
+            "status": "success",
+            "mode": "comparables",
+            "title": f"{p.year} {make.title()} {model.title()}",
+            "price": round(max(price, 0), 0),
             "comparables": len(comps),
             "used_years": sorted(comps.year.unique().tolist())
         }
 
     # =========================
-    # FEATURES (SAFE)
+    # ML FALLBACK MODE
     # =========================
-    X = comps[["odometer", "year"]].copy()
-    y = comps.price.values
+    all_data = df[(df.make == make) & (df.model == model)]
 
-    # province يدخل فقط لو الداتا كفاية
-    if len(comps) >= 5 and comps.province.notna().any():
-        counts = comps.province.value_counts()
-        valid = counts[counts >= 2].index.tolist()
+    if len(all_data) < MIN_SAMPLES:
+        return {
+            "status": "no_comparables",
+            "mode": "none",
+            "comparables": len(all_data)
+        }
 
-        if valid:
-            prov = comps.province.where(
-                comps.province.isin(valid),
-                other="other"
-            )
-            dummies = pd.get_dummies(prov, prefix="province")
-            X = pd.concat([X, dummies], axis=1)
+    X = all_data[["odometer", "year"]].copy()
+    y = all_data.price.values
 
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
@@ -141,36 +152,20 @@ def estimate_value(p: EstimateRequest):
     lr = LinearRegression()
     lr.fit(Xs, y)
 
-    # =========================
-    # PREDICTION
-    # =========================
-    input_data = {
+    input_df = pd.DataFrame([{
         "odometer": p.odometer,
         "year": p.year
-    }
+    }])
 
-    for col in X.columns:
-        if col.startswith("province_"):
-            prov = col.replace("province_", "")
-            input_data[col] = 1 if clean(p.province) == prov else 0
-
-    input_df = pd.DataFrame([input_data])
-
-    for col in X.columns:
-        if col not in input_df.columns:
-            input_df[col] = 0
-
-    input_df = input_df[X.columns]
     price = lr.predict(scaler.transform(input_df))[0]
-    price = max(price, 0)
 
     return {
         "status": "success",
+        "mode": "ml_fallback",
         "title": f"{p.year} {make.title()} {model.title()}",
-        "price": round(price, 0),
-        "comparables": len(comps),
-        "used_years": sorted(comps.year.unique().tolist()),
-        "trim_used": trim
+        "price": round(max(price, 0), 0),
+        "comparables": len(all_data),
+        "used_years": sorted(all_data.year.unique().tolist())
     }
 
 # =========================
@@ -178,10 +173,7 @@ def estimate_value(p: EstimateRequest):
 # =========================
 @app.get("/")
 def health():
-    return {
-        "status": "ok",
-        "records": len(df)
-    }
+    return {"status": "ok", "records": len(df)}
 
 @app.post("/estimate")
 def estimate(p: EstimateRequest):
