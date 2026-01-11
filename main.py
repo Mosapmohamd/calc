@@ -11,7 +11,7 @@ from fuzzywuzzy import fuzz, process
 CSV_PATH = "test.csv"
 FUZZY_THRESHOLD = 80
 MIN_SAMPLES = 3
-YEAR_WINDOW = 3
+YEAR_WINDOW = 2
 
 app = FastAPI(title="Vehicle Price Prediction API")
 
@@ -208,3 +208,4 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
+
