@@ -15,6 +15,7 @@ MIN_SAMPLES = 2
 YEAR_DELTA = 2
 MILEAGE_RATE = 0.1
 CONFIDENCE = 0.9
+MIN_MODEL_YEAR = 2010
 
 app = FastAPI(title="Vehicle Price Prediction API")
 
@@ -114,6 +115,16 @@ def train_weighted_regression(comps: pd.DataFrame, target_year: int):
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
+
+    # ❌ old cars rule
+    if p.year < MIN_MODEL_YEAR:
+        return {
+            "status": "not_supported",
+            "title": f"{p.year} {p.make} {p.model}",
+            "price": None,
+            "note": "Model year below supported range"
+        }
+
     make = match_make_smart(p.make, df.make.unique().tolist())
     if not make:
         return {"status": "error", "note": "make not found"}
@@ -144,6 +155,14 @@ def estimate_value(p: EstimateRequest):
 
     n = len(comps)
 
+    if n == 0:
+        return {
+            "status": "no_comparables",
+            "title": title,
+            "price": None,
+            "comparables": 0
+        }
+
     if n == 1:
         base = comps.iloc[0]
         adj = base.price - (p.odometer - base.odometer) * MILEAGE_RATE
@@ -169,49 +188,34 @@ def estimate_value(p: EstimateRequest):
             "used_years": sorted(comps.year.unique().tolist())
         }
 
-    if n >= 3:
-        lr, scaler, sigma = train_weighted_regression(comps, p.year)
-        pred = lr.predict(scaler.transform([[p.odometer]]))[0]
-        if pred <= 0:
-            pred = comps.price.median()
-        if not np.isfinite(sigma):
-            return {
-                "status": "success",
-                "mode": "weighted_regression_low_variance",
-                "title": title,
-                "price": round(pred, 0),
-                "comparables": n,
-                "used_years": sorted(comps.year.unique().tolist())
-            }
-        t_val = t.ppf((1 + CONFIDENCE) / 2, df=n - 1)
-        margin = t_val * sigma
+    # n >= 3
+    lr, scaler, sigma = train_weighted_regression(comps, p.year)
+    pred = lr.predict(scaler.transform([[p.odometer]]))[0]
+    if pred <= 0:
+        pred = comps.price.median()
+
+    if not np.isfinite(sigma):
         return {
             "status": "success",
-            "mode": "weighted_regression",
+            "mode": "weighted_regression_low_variance",
             "title": title,
             "price": round(pred, 0),
-            "low": round(max(pred - margin, 0), 0),
-            "high": round(pred + margin, 0),
             "comparables": n,
             "used_years": sorted(comps.year.unique().tolist())
         }
 
-    all_data = df[(df.make == make) & (df.model == model)]
-    if len(all_data) < MIN_SAMPLES:
-        return {"status": "no_comparables", "mode": "none"}
-
-    lr, scaler, _ = train_weighted_regression(all_data, p.year)
-    price = lr.predict(scaler.transform([[p.odometer]]))[0]
-    if price <= 0:
-        price = all_data.price.median()
+    t_val = t.ppf((1 + CONFIDENCE) / 2, df=n - 1)
+    margin = t_val * sigma
 
     return {
         "status": "success",
-        "mode": "ml_fallback_weighted",
+        "mode": "weighted_regression",
         "title": title,
-        "price": round(price, 0),
-        "comparables": len(all_data),
-        "used_years": sorted(all_data.year.unique().tolist())
+        "price": round(pred, 0),
+        "low": round(max(pred - margin, 0), 0),
+        "high": round(pred + margin, 0),
+        "comparables": n,
+        "used_years": sorted(comps.year.unique().tolist())
     }
 
 # =========================
@@ -225,7 +229,6 @@ def health():
 def estimate(p: EstimateRequest):
     return estimate_value(p)
 
-# accepts LIST directly
 @app.post("/estimate/batch")
 def estimate_batch(vehicles: List[EstimateRequest]):
     return [estimate_value(v) for v in vehicles]
