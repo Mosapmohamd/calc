@@ -29,11 +29,33 @@ def clean(s: Optional[str]) -> Optional[str]:
     s = re.sub(r"[^a-z0-9 ]", "", s)
     return s if s else None
 
-def fuzzy_match(value: Optional[str], choices: List[str], threshold=80):
+def fuzzy_match_make(value: Optional[str], choices: List[str]):
     if not value or not choices:
         return None
-    match = process.extractOne(value, choices, scorer=fuzz.ratio)
-    if match and match[1] >= threshold:
+    val = clean(value)
+    for c in choices:
+        if val == c:
+            return c
+    for c in choices:
+        if val in c or c in val:
+            return c
+    match = process.extractOne(val, choices, scorer=fuzz.partial_ratio)
+    if match and match[1] >= FUZZY_THRESHOLD:
+        return match[0]
+    return None
+
+def match_model_smart(value: Optional[str], models: List[str]):
+    if not value or not models:
+        return None
+    val = clean(value)
+    for m in models:
+        if val == m:
+            return m
+    for m in models:
+        if val in m or m in val:
+            return m
+    match = process.extractOne(val, models, scorer=fuzz.partial_ratio)
+    if match and match[1] >= FUZZY_THRESHOLD:
         return match[0]
     return None
 
@@ -86,7 +108,7 @@ def train_weighted_regression(comps: pd.DataFrame, target_year: int):
     y = comps.price.values
 
     year_diff = (comps.year - target_year).abs()
-    weights = 1 / (1 + year_diff)  # الأقرب سنة وزن أعلى
+    weights = 1 / (1 + year_diff)
 
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
@@ -104,12 +126,12 @@ def train_weighted_regression(comps: pd.DataFrame, target_year: int):
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
-    make = fuzzy_match(clean(p.make), df.make.unique().tolist())
+    make = fuzzy_match_make(p.make, df.make.unique().tolist())
     if not make:
         return {"status": "error", "note": "make not found"}
 
-    model = fuzzy_match(
-        clean(p.model),
+    model = match_model_smart(
+        p.model,
         df[df.make == make].model.unique().tolist()
     )
     if not model:
@@ -117,9 +139,6 @@ def estimate_value(p: EstimateRequest):
 
     title = f"{p.year} {make.title()} {model.title()}"
 
-    # =========================
-    # COMPARABLES ±2 YEARS
-    # =========================
     comps = df[
         (df.make == make) &
         (df.model == model) &
@@ -137,9 +156,6 @@ def estimate_value(p: EstimateRequest):
 
     n = len(comps)
 
-    # =========================
-    # PRICING LOGIC
-    # =========================
     if n == 0:
         pass
 
@@ -199,9 +215,6 @@ def estimate_value(p: EstimateRequest):
             "used_years": sorted(comps.year.unique().tolist())
         }
 
-    # =========================
-    # ML FALLBACK MODE
-    # =========================
     all_data = df[(df.make == make) & (df.model == model)]
     if len(all_data) < MIN_SAMPLES:
         return {"status": "no_comparables", "mode": "none"}
