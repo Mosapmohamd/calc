@@ -2,15 +2,19 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional, List
 import pandas as pd
+import numpy as np
 import re
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import t
 from fuzzywuzzy import fuzz, process
 
 CSV_PATH = "test.csv"
 FUZZY_THRESHOLD = 80
 MIN_SAMPLES = 2
 YEAR_DELTA = 2
+MILEAGE_RATE = 0.1
+CONFIDENCE = 0.9
 
 app = FastAPI(title="Vehicle Price Prediction API")
 
@@ -75,6 +79,25 @@ class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
 
 # =========================
+# REGRESSION TRAINING
+# =========================
+def train_regression(comps: pd.DataFrame):
+    X = comps[["odometer"]].values
+    y = comps.price.values
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    lr = LinearRegression()
+    lr.fit(Xs, y)
+
+    preds = lr.predict(Xs)
+    residuals = y - preds
+    sigma = residuals.std(ddof=1) if len(residuals) > 1 else np.nan
+
+    return lr, scaler, sigma
+
+# =========================
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
@@ -89,8 +112,10 @@ def estimate_value(p: EstimateRequest):
     if not model:
         return {"status": "error", "note": "model not found"}
 
+    title = f"{p.year} {make.title()} {model.title()}"
+
     # =========================
-    # COMPARABLES MODE ±2 YEARS
+    # COMPARABLES ±2 YEARS
     # =========================
     comps = df[
         (df.make == make) &
@@ -101,33 +126,79 @@ def estimate_value(p: EstimateRequest):
 
     trim = clean(p.trim)
     if trim and "trim" in comps.columns:
-        trimmed = comps[comps.trim == trim]
-        if len(trimmed) >= MIN_SAMPLES:
-            comps = trimmed
+        similar = comps[comps.trim.apply(
+            lambda x: fuzz.partial_ratio(trim, x) >= FUZZY_THRESHOLD if isinstance(x, str) else False
+        )]
+        if len(similar) >= MIN_SAMPLES:
+            comps = similar
 
-    if len(comps) >= MIN_SAMPLES:
-        X = comps[["odometer", "year"]].copy()
-        y = comps.price.values
+    n = len(comps)
 
-        scaler = StandardScaler()
-        Xs = scaler.fit_transform(X)
+    # =========================
+    # PRICING LOGIC
+    # =========================
+    if n == 0:
+        pass  # fallback later
 
-        lr = LinearRegression()
-        lr.fit(Xs, y)
+    elif n == 1:
+        base = comps.iloc[0]
+        adj = base.price - (p.odometer - base.odometer) * MILEAGE_RATE
+        return {
+            "status": "success",
+            "mode": "single_comparable",
+            "title": title,
+            "price": round(max(adj, 0), 0),
+            "comparables": 1,
+            "used_years": [int(base.year)]
+        }
 
-        input_df = pd.DataFrame([{
-            "odometer": p.odometer,
-            "year": p.year
-        }])
+    elif n == 2:
+        return {
+            "status": "success",
+            "mode": "two_comparables",
+            "title": title,
+            "price": round(comps.price.mean(), 0),
+            "comparables": 2,
+            "used_years": sorted(comps.year.unique().tolist())
+        }
 
-        price = lr.predict(scaler.transform(input_df))[0]
+    elif n >= 3:
+        lr, scaler, sigma = train_regression(comps)
+        pred = lr.predict(scaler.transform([[p.odometer]]))[0]
+
+        if not np.isfinite(sigma):
+            price = pred
+            note = "low_variance"
+        else:
+            t_val = t.ppf((1 + CONFIDENCE) / 2, df=n - 1)
+            margin = t_val * sigma
+            low = pred - margin
+            high = pred + margin
+
+            price = pred
+            if price <= 0:
+                price = comps.price.median()
+
+            return {
+                "status": "success",
+                "mode": "regression",
+                "title": title,
+                "price": round(price, 0),
+                "low": round(max(low, 0), 0),
+                "high": round(high, 0),
+                "comparables": n,
+                "used_years": sorted(comps.year.unique().tolist())
+            }
+
+        if price <= 0:
+            price = comps.price.median()
 
         return {
             "status": "success",
-            "mode": "comparables",
-            "title": f"{p.year} {make.title()} {model.title()}",
-            "price": round(max(price, 0), 0),
-            "comparables": len(comps),
+            "mode": "regression_low_variance",
+            "title": title,
+            "price": round(price, 0),
+            "comparables": n,
             "used_years": sorted(comps.year.unique().tolist())
         }
 
@@ -135,7 +206,6 @@ def estimate_value(p: EstimateRequest):
     # ML FALLBACK MODE
     # =========================
     all_data = df[(df.make == make) & (df.model == model)]
-
     if len(all_data) < MIN_SAMPLES:
         return {
             "status": "no_comparables",
@@ -143,27 +213,16 @@ def estimate_value(p: EstimateRequest):
             "comparables": len(all_data)
         }
 
-    X = all_data[["odometer", "year"]].copy()
-    y = all_data.price.values
-
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-
-    lr = LinearRegression()
-    lr.fit(Xs, y)
-
-    input_df = pd.DataFrame([{
-        "odometer": p.odometer,
-        "year": p.year
-    }])
-
-    price = lr.predict(scaler.transform(input_df))[0]
+    lr, scaler, _ = train_regression(all_data)
+    price = lr.predict(scaler.transform([[p.odometer]]))[0]
+    if price <= 0:
+        price = all_data.price.median()
 
     return {
         "status": "success",
         "mode": "ml_fallback",
-        "title": f"{p.year} {make.title()} {model.title()}",
-        "price": round(max(price, 0), 0),
+        "title": title,
+        "price": round(price, 0),
         "comparables": len(all_data),
         "used_years": sorted(all_data.year.unique().tolist())
     }
