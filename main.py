@@ -29,19 +29,19 @@ def clean(s: Optional[str]) -> Optional[str]:
     s = re.sub(r"[^a-z0-9 ]", "", s)
     return s if s else None
 
-def fuzzy_match_make(value: Optional[str], choices: List[str]):
-    if not value or not choices:
+def match_make_smart(value: Optional[str], makes: List[str]):
+    if not value or not makes:
         return None
     val = clean(value)
-    for c in choices:
-        if val == c:
-            return c
-    for c in choices:
-        if val in c or c in val:
-            return c
-    match = process.extractOne(val, choices, scorer=fuzz.partial_ratio)
-    if match and match[1] >= FUZZY_THRESHOLD:
-        return match[0]
+    for m in makes:
+        if val == m:
+            return m
+    for m in makes:
+        if val in m or m in val:
+            return m
+    hit = process.extractOne(val, makes, scorer=fuzz.partial_ratio)
+    if hit and hit[1] >= FUZZY_THRESHOLD:
+        return hit[0]
     return None
 
 def match_model_smart(value: Optional[str], models: List[str]):
@@ -54,9 +54,9 @@ def match_model_smart(value: Optional[str], models: List[str]):
     for m in models:
         if val in m or m in val:
             return m
-    match = process.extractOne(val, models, scorer=fuzz.partial_ratio)
-    if match and match[1] >= FUZZY_THRESHOLD:
-        return match[0]
+    hit = process.extractOne(val, models, scorer=fuzz.partial_ratio)
+    if hit and hit[1] >= FUZZY_THRESHOLD:
+        return hit[0]
     return None
 
 # =========================
@@ -64,7 +64,6 @@ def match_model_smart(value: Optional[str], models: List[str]):
 # =========================
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-
     df = df.rename(columns={
         "Year": "year",
         "Make": "make",
@@ -74,13 +73,10 @@ def load_data(path: str) -> pd.DataFrame:
         "Price": "price",
         "Province": "province",
     })
-
     for c in ["year", "odometer", "price"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
     for c in ["make", "model", "trim", "province"]:
         df[c] = df[c].apply(clean)
-
     df = df.dropna(subset=["year", "make", "model", "odometer", "price"])
     return df.reset_index(drop=True)
 
@@ -97,36 +93,28 @@ class EstimateRequest(BaseModel):
     trim: Optional[str] = None
     province: Optional[str] = None
 
-class BatchEstimateRequest(BaseModel):
-    vehicles: List[EstimateRequest]
-
 # =========================
 # WEIGHTED REGRESSION
 # =========================
 def train_weighted_regression(comps: pd.DataFrame, target_year: int):
     X = comps[["odometer"]].values
     y = comps.price.values
-
     year_diff = (comps.year - target_year).abs()
     weights = 1 / (1 + year_diff)
-
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
-
     lr = LinearRegression()
     lr.fit(Xs, y, sample_weight=weights)
-
     preds = lr.predict(Xs)
     residuals = y - preds
     sigma = residuals.std(ddof=1) if len(residuals) > 1 else np.nan
-
     return lr, scaler, sigma
 
 # =========================
 # CORE LOGIC
 # =========================
 def estimate_value(p: EstimateRequest):
-    make = fuzzy_match_make(p.make, df.make.unique().tolist())
+    make = match_make_smart(p.make, df.make.unique().tolist())
     if not make:
         return {"status": "error", "note": "make not found"}
 
@@ -156,10 +144,7 @@ def estimate_value(p: EstimateRequest):
 
     n = len(comps)
 
-    if n == 0:
-        pass
-
-    elif n == 1:
+    if n == 1:
         base = comps.iloc[0]
         adj = base.price - (p.odometer - base.odometer) * MILEAGE_RATE
         return {
@@ -171,7 +156,7 @@ def estimate_value(p: EstimateRequest):
             "used_years": [int(base.year)]
         }
 
-    elif n == 2:
+    if n == 2:
         base_price = comps.price.mean()
         base_odo = comps.odometer.mean()
         adj = base_price - (p.odometer - base_odo) * MILEAGE_RATE
@@ -184,13 +169,11 @@ def estimate_value(p: EstimateRequest):
             "used_years": sorted(comps.year.unique().tolist())
         }
 
-    elif n >= 3:
+    if n >= 3:
         lr, scaler, sigma = train_weighted_regression(comps, p.year)
         pred = lr.predict(scaler.transform([[p.odometer]]))[0]
-
         if pred <= 0:
             pred = comps.price.median()
-
         if not np.isfinite(sigma):
             return {
                 "status": "success",
@@ -200,10 +183,8 @@ def estimate_value(p: EstimateRequest):
                 "comparables": n,
                 "used_years": sorted(comps.year.unique().tolist())
             }
-
         t_val = t.ppf((1 + CONFIDENCE) / 2, df=n - 1)
         margin = t_val * sigma
-
         return {
             "status": "success",
             "mode": "weighted_regression",
@@ -244,6 +225,7 @@ def health():
 def estimate(p: EstimateRequest):
     return estimate_value(p)
 
+# accepts LIST directly
 @app.post("/estimate/batch")
-def estimate_batch(p: BatchEstimateRequest):
-    return [estimate_value(v) for v in p.vehicles]
+def estimate_batch(vehicles: List[EstimateRequest]):
+    return [estimate_value(v) for v in vehicles]
