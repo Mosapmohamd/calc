@@ -79,17 +79,20 @@ class BatchEstimateRequest(BaseModel):
     vehicles: List[EstimateRequest]
 
 # =========================
-# REGRESSION TRAINING
+# WEIGHTED REGRESSION
 # =========================
-def train_regression(comps: pd.DataFrame):
+def train_weighted_regression(comps: pd.DataFrame, target_year: int):
     X = comps[["odometer"]].values
     y = comps.price.values
+
+    year_diff = (comps.year - target_year).abs()
+    weights = 1 / (1 + year_diff)  # الأقرب سنة وزن أعلى
 
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
 
     lr = LinearRegression()
-    lr.fit(Xs, y)
+    lr.fit(Xs, y, sample_weight=weights)
 
     preds = lr.predict(Xs)
     residuals = y - preds
@@ -138,7 +141,7 @@ def estimate_value(p: EstimateRequest):
     # PRICING LOGIC
     # =========================
     if n == 0:
-        pass  # fallback later
+        pass
 
     elif n == 1:
         base = comps.iloc[0]
@@ -154,10 +157,8 @@ def estimate_value(p: EstimateRequest):
 
     elif n == 2:
         base_price = comps.price.mean()
-        base_odometer = comps.odometer.mean()
-    
-        adj = base_price - (p.odometer - base_odometer) * MILEAGE_RATE
-    
+        base_odo = comps.odometer.mean()
+        adj = base_price - (p.odometer - base_odo) * MILEAGE_RATE
         return {
             "status": "success",
             "mode": "two_comparables_adjusted",
@@ -168,41 +169,32 @@ def estimate_value(p: EstimateRequest):
         }
 
     elif n >= 3:
-        lr, scaler, sigma = train_regression(comps)
+        lr, scaler, sigma = train_weighted_regression(comps, p.year)
         pred = lr.predict(scaler.transform([[p.odometer]]))[0]
 
+        if pred <= 0:
+            pred = comps.price.median()
+
         if not np.isfinite(sigma):
-            price = pred
-            note = "low_variance"
-        else:
-            t_val = t.ppf((1 + CONFIDENCE) / 2, df=n - 1)
-            margin = t_val * sigma
-            low = pred - margin
-            high = pred + margin
-
-            price = pred
-            if price <= 0:
-                price = comps.price.median()
-
             return {
                 "status": "success",
-                "mode": "regression",
+                "mode": "weighted_regression_low_variance",
                 "title": title,
-                "price": round(price, 0),
-                "low": round(max(low, 0), 0),
-                "high": round(high, 0),
+                "price": round(pred, 0),
                 "comparables": n,
                 "used_years": sorted(comps.year.unique().tolist())
             }
 
-        if price <= 0:
-            price = comps.price.median()
+        t_val = t.ppf((1 + CONFIDENCE) / 2, df=n - 1)
+        margin = t_val * sigma
 
         return {
             "status": "success",
-            "mode": "regression_low_variance",
+            "mode": "weighted_regression",
             "title": title,
-            "price": round(price, 0),
+            "price": round(pred, 0),
+            "low": round(max(pred - margin, 0), 0),
+            "high": round(pred + margin, 0),
             "comparables": n,
             "used_years": sorted(comps.year.unique().tolist())
         }
@@ -212,20 +204,16 @@ def estimate_value(p: EstimateRequest):
     # =========================
     all_data = df[(df.make == make) & (df.model == model)]
     if len(all_data) < MIN_SAMPLES:
-        return {
-            "status": "no_comparables",
-            "mode": "none",
-            "comparables": len(all_data)
-        }
+        return {"status": "no_comparables", "mode": "none"}
 
-    lr, scaler, _ = train_regression(all_data)
+    lr, scaler, _ = train_weighted_regression(all_data, p.year)
     price = lr.predict(scaler.transform([[p.odometer]]))[0]
     if price <= 0:
         price = all_data.price.median()
 
     return {
         "status": "success",
-        "mode": "ml_fallback",
+        "mode": "ml_fallback_weighted",
         "title": title,
         "price": round(price, 0),
         "comparables": len(all_data),
@@ -246,4 +234,3 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
-
