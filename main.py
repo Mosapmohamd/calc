@@ -153,11 +153,16 @@ def estimate_value(p: EstimateRequest):
         }
 
     elif n == 2:
+        base_price = comps.price.mean()
+        base_odometer = comps.odometer.mean()
+    
+        adj = base_price - (p.odometer - base_odometer) * MILEAGE_RATE
+    
         return {
             "status": "success",
-            "mode": "two_comparables",
+            "mode": "two_comparables_adjusted",
             "title": title,
-            "price": round(comps.price.mean(), 0),
+            "price": round(max(adj, 0), 0),
             "comparables": 2,
             "used_years": sorted(comps.year.unique().tolist())
         }
@@ -241,3 +246,4 @@ def estimate(p: EstimateRequest):
 @app.post("/estimate/batch")
 def estimate_batch(p: BatchEstimateRequest):
     return [estimate_value(v) for v in p.vehicles]
+
