@@ -16,6 +16,7 @@ YEAR_DELTA = 2
 MILEAGE_RATE = 0.1
 CONFIDENCE = 0.9
 MIN_MODEL_YEAR = 2010
+HYBRID_BONUS = 3000
 
 app = FastAPI(title="Vehicle Price Prediction API")
 
@@ -60,6 +61,12 @@ def match_model_smart(value: Optional[str], models: List[str]):
         return hit[0]
     return None
 
+def is_hybrid(p: BaseModel) -> bool:
+    text = clean(f"{p.make} {p.model} {p.trim or ''}")
+    if not text:
+        return False
+    return "hybrid" in text
+
 # =========================
 # LOAD DATA
 # =========================
@@ -84,7 +91,7 @@ def load_data(path: str) -> pd.DataFrame:
 df = load_data(CSV_PATH)
 
 # =========================
-# REQUEST MODELS
+# REQUEST MODEL
 # =========================
 class EstimateRequest(BaseModel):
     year: int
@@ -102,13 +109,17 @@ def train_weighted_regression(comps: pd.DataFrame, target_year: int):
     y = comps.price.values
     year_diff = (comps.year - target_year).abs()
     weights = 1 / (1 + year_diff)
+
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
+
     lr = LinearRegression()
     lr.fit(Xs, y, sample_weight=weights)
+
     preds = lr.predict(Xs)
     residuals = y - preds
     sigma = residuals.std(ddof=1) if len(residuals) > 1 else np.nan
+
     return lr, scaler, sigma
 
 # =========================
@@ -116,7 +127,6 @@ def train_weighted_regression(comps: pd.DataFrame, target_year: int):
 # =========================
 def estimate_value(p: EstimateRequest):
 
-    # ❌ old cars rule
     if p.year < MIN_MODEL_YEAR:
         return {
             "status": "not_supported",
@@ -155,6 +165,9 @@ def estimate_value(p: EstimateRequest):
 
     n = len(comps)
 
+    def apply_hybrid(price: float) -> float:
+        return price + HYBRID_BONUS if is_hybrid(p) else price
+
     if n == 0:
         return {
             "status": "no_comparables",
@@ -166,11 +179,12 @@ def estimate_value(p: EstimateRequest):
     if n == 1:
         base = comps.iloc[0]
         adj = base.price - (p.odometer - base.odometer) * MILEAGE_RATE
+        price = apply_hybrid(max(adj, 0))
         return {
             "status": "success",
             "mode": "single_comparable",
             "title": title,
-            "price": round(max(adj, 0), 0),
+            "price": round(price, 0),
             "comparables": 1,
             "used_years": [int(base.year)]
         }
@@ -179,20 +193,22 @@ def estimate_value(p: EstimateRequest):
         base_price = comps.price.mean()
         base_odo = comps.odometer.mean()
         adj = base_price - (p.odometer - base_odo) * MILEAGE_RATE
+        price = apply_hybrid(max(adj, 0))
         return {
             "status": "success",
             "mode": "two_comparables_adjusted",
             "title": title,
-            "price": round(max(adj, 0), 0),
+            "price": round(price, 0),
             "comparables": 2,
             "used_years": sorted(comps.year.unique().tolist())
         }
 
-    # n >= 3
     lr, scaler, sigma = train_weighted_regression(comps, p.year)
     pred = lr.predict(scaler.transform([[p.odometer]]))[0]
     if pred <= 0:
         pred = comps.price.median()
+
+    pred = apply_hybrid(pred)
 
     if not np.isfinite(sigma):
         return {
